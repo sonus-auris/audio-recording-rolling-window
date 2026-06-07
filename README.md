@@ -29,6 +29,7 @@ At 128 kbps, 500 hours is about 28.8 GB.
 ## Runtime Notes
 
 - Android uses a foreground microphone service while recording. The app asks for microphone permission and notification permission; it does not request storage, location, contacts, or battery optimization permissions.
+- On Android 11+, microphone capture must be started while the app is foregrounded. After the foreground microphone service is running, the app can move to the background and continue recording under the visible notification. The app does not try to auto-start microphone capture from boot or from a background-only state.
 - Android app backup is disabled so app-local audio and cloud configuration are not copied into device backups.
 - iOS uses microphone permission and the `audio` background mode. iOS will still stop capture if the user force-quits the app or the OS terminates it.
 - Local files are stored inside the app support directory. The segment index is written atomically, and corrupt index files are quarantined instead of crashing startup. Old local files are deleted only after they are uploaded, so failed uploads do not silently discard audio.
@@ -69,3 +70,20 @@ Run on a configured device:
 ```
 
 This machine currently needs Android SDK setup for Android builds, and full Xcode plus CocoaPods for iOS builds.
+
+## Emulator Validation
+
+An Android API 36 ARM64 emulator named `audio_dashcam_api36` was created with microphone input enabled.
+
+Verified on that emulator:
+
+- Debug APK builds and installs.
+- `RECORD_AUDIO`, `POST_NOTIFICATIONS`, `FOREGROUND_SERVICE`, and `FOREGROUND_SERVICE_MICROPHONE` are declared/granted.
+- Starting capture from the foreground creates an Android foreground service with microphone type `0x00000080`.
+- After sending the app Home, the foreground service remained alive past multiple one-minute segment rotations.
+- `.m4a` segment files were written under the app sandbox at roughly 489 KB per minute, matching the default 64 kbps encoding.
+- `segments.v1.json` was updated with closed segment metadata.
+
+Observed emulator limitation:
+
+- The Android emulator audio HAL logged repeated `pcm_readi` I/O errors. Android's own MediaRecorder documentation says emulator audio recording is not a substitute for a real recording device, so final audio-quality validation still needs a physical Android phone.
