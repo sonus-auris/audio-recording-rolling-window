@@ -1,0 +1,28 @@
+enum CloudProvider {
+  s3,
+  googleDrive,
+  oneDrive,
+  iCloudDrive;
+
+  String get label {
+    switch (this) {
+      case CloudProvider.s3:
+        return 'AWS S3';
+      case CloudProvider.googleDrive:
+        return 'Google Drive';
+      case CloudProvider.oneDrive:
+        return 'Microsoft OneDrive';
+      case CloudProvider.iCloudDrive:
+        return 'Apple iCloud Drive';
+    }
+  }
+
+  bool get isImplemented => this == CloudProvider.s3;
+
+  static CloudProvider fromName(String? name) {
+    return CloudProvider.values.firstWhere(
+      (provider) => provider.name == name,
+      orElse: () => CloudProvider.s3,
+    );
+  }
+}

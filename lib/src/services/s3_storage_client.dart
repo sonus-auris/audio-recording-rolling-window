@@ -1,0 +1,290 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart';
+import 'package:http/http.dart' as http;
+
+import '../models/app_config.dart';
+import '../models/cloud_secrets.dart';
+import '../models/recording_segment.dart';
+
+class UploadResult {
+  const UploadResult.success(this.remoteKey) : error = null;
+
+  const UploadResult.failure(this.error) : remoteKey = null;
+
+  final String? remoteKey;
+  final String? error;
+
+  bool get isSuccess => remoteKey != null;
+}
+
+class S3StorageClient {
+  S3StorageClient({
+    http.Client? httpClient,
+    this.requestTimeout = const Duration(seconds: 45),
+  }) : _httpClient = httpClient ?? http.Client();
+
+  final http.Client _httpClient;
+  final Duration requestTimeout;
+
+  Future<UploadResult> uploadSegment({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required RecordingSegment segment,
+    required File file,
+  }) async {
+    if (!config.s3TargetReady || !secrets.hasS3Credentials) {
+      return const UploadResult.failure(
+        'S3 bucket, region, and credentials are required.',
+      );
+    }
+    if (!await file.exists()) {
+      return const UploadResult.failure('Local segment file is missing.');
+    }
+    try {
+      final key = objectKeyFor(config, segment);
+      final bytes = await file.readAsBytes();
+      final uri = _objectUri(config, key);
+      final payloadHash = sha256.convert(bytes).toString();
+      final headers = _signedHeaders(
+        method: 'PUT',
+        uri: uri,
+        config: config,
+        secrets: secrets,
+        payloadHash: payloadHash,
+        extraHeaders: const {'content-type': 'audio/mp4'},
+      );
+      final response = await _httpClient
+          .put(uri, headers: headers, body: bytes)
+          .timeout(requestTimeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return UploadResult.success(key);
+      }
+      return UploadResult.failure(
+        'S3 upload failed: HTTP ${response.statusCode} ${response.reasonPhrase ?? ''}'
+            .trim(),
+      );
+    } on TimeoutException {
+      return UploadResult.failure(
+        'S3 upload timed out after ${requestTimeout.inSeconds} seconds.',
+      );
+    } on FormatException catch (error) {
+      return UploadResult.failure(error.message);
+    } catch (error) {
+      return UploadResult.failure('S3 upload failed: $error');
+    }
+  }
+
+  Future<String?> deleteObject({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required String key,
+  }) async {
+    if (!config.s3TargetReady || !secrets.hasS3Credentials) {
+      return 'S3 bucket, region, and credentials are required.';
+    }
+    try {
+      final uri = _objectUri(config, key);
+      final payloadHash = sha256.convert(const <int>[]).toString();
+      final headers = _signedHeaders(
+        method: 'DELETE',
+        uri: uri,
+        config: config,
+        secrets: secrets,
+        payloadHash: payloadHash,
+      );
+      final response = await _httpClient
+          .delete(uri, headers: headers)
+          .timeout(requestTimeout);
+      if (response.statusCode == 204 ||
+          response.statusCode == 200 ||
+          response.statusCode == 404) {
+        return null;
+      }
+      return 'S3 delete failed: HTTP ${response.statusCode} ${response.reasonPhrase ?? ''}'
+          .trim();
+    } on TimeoutException {
+      return 'S3 delete timed out after ${requestTimeout.inSeconds} seconds.';
+    } on FormatException catch (error) {
+      return error.message;
+    } catch (error) {
+      return 'S3 delete failed: $error';
+    }
+  }
+
+  String objectKeyFor(AppConfig config, RecordingSegment segment) {
+    final prefix = config.s3Prefix
+        .split('/')
+        .map((part) => part.trim())
+        .where((part) => part.isNotEmpty)
+        .join('/');
+    final started = segment.startedAtUtc.toUtc();
+    final parts = <String>[
+      if (prefix.isNotEmpty) prefix,
+      config.deviceId,
+      started.year.toString().padLeft(4, '0'),
+      started.month.toString().padLeft(2, '0'),
+      started.day.toString().padLeft(2, '0'),
+      started.hour.toString().padLeft(2, '0'),
+      '${segment.id}.m4a',
+    ];
+    return parts.join('/');
+  }
+
+  Uri _objectUri(AppConfig config, String key) {
+    final endpoint = config.s3Endpoint.trim();
+    if (endpoint.isNotEmpty) {
+      final base = Uri.parse(endpoint);
+      if (base.scheme != 'https') {
+        throw const FormatException('S3-compatible endpoints must use HTTPS.');
+      }
+      if (config.s3Bucket.trim().contains('/')) {
+        throw const FormatException('S3 bucket must not contain slashes.');
+      }
+      final baseSegments = base.pathSegments.where((part) => part.isNotEmpty);
+      return base.replace(
+        query: '',
+        fragment: '',
+        pathSegments: [
+          ...baseSegments,
+          config.s3Bucket.trim(),
+          ...key.split('/'),
+        ],
+      );
+    }
+    final bucket = config.s3Bucket.trim();
+    final validDnsBucket = RegExp(
+      r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$',
+    ).hasMatch(bucket);
+    if (!validDnsBucket) {
+      throw const FormatException(
+        'AWS S3 bucket must be 3-63 lowercase letters, numbers, and hyphens for direct AWS uploads.',
+      );
+    }
+    return Uri.https(
+      '$bucket.s3.${config.s3Region.trim()}.amazonaws.com',
+      '/$key',
+    );
+  }
+
+  Map<String, String> _signedHeaders({
+    required String method,
+    required Uri uri,
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required String payloadHash,
+    Map<String, String> extraHeaders = const {},
+  }) {
+    final now = DateTime.now().toUtc();
+    final amzDate = _amzDate(now);
+    final dateStamp = _dateStamp(now);
+    final host = uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
+    final headers = <String, String>{
+      'host': host,
+      'x-amz-content-sha256': payloadHash,
+      'x-amz-date': amzDate,
+      ...extraHeaders.map((key, value) => MapEntry(key.toLowerCase(), value)),
+    };
+    if (secrets.s3SessionToken.trim().isNotEmpty) {
+      headers['x-amz-security-token'] = secrets.s3SessionToken.trim();
+    }
+    final signedHeaderNames = headers.keys.toList()..sort();
+    final canonicalHeaders = signedHeaderNames
+        .map((name) => '$name:${headers[name]!.trim()}\n')
+        .join();
+    final signedHeaders = signedHeaderNames.join(';');
+    final canonicalRequest =
+        [
+              method,
+              _canonicalUri(uri),
+              uri.queryParameters.entries
+                  .map(
+                    (entry) =>
+                        '${_awsEncode(entry.key)}=${_awsEncode(entry.value)}',
+                  )
+                  .toList()
+                ..sort(),
+              canonicalHeaders,
+              signedHeaders,
+              payloadHash,
+            ]
+            .map((part) {
+              if (part is List<String>) {
+                return part.join('&');
+              }
+              return part.toString();
+            })
+            .join('\n');
+    final credentialScope =
+        '$dateStamp/${config.s3Region.trim()}/s3/aws4_request';
+    final stringToSign = [
+      'AWS4-HMAC-SHA256',
+      amzDate,
+      credentialScope,
+      sha256.convert(utf8.encode(canonicalRequest)).toString(),
+    ].join('\n');
+    final signature = _hmacHex(
+      _signingKey(
+        secrets.s3SecretAccessKey.trim(),
+        dateStamp,
+        config.s3Region.trim(),
+      ),
+      stringToSign,
+    );
+    return {
+      ...headers,
+      'Authorization':
+          'AWS4-HMAC-SHA256 Credential=${secrets.s3AccessKeyId.trim()}/$credentialScope, SignedHeaders=$signedHeaders, Signature=$signature',
+    };
+  }
+
+  Uint8List _signingKey(String secret, String dateStamp, String region) {
+    final kDate = _hmacBytes(utf8.encode('AWS4$secret'), dateStamp);
+    final kRegion = _hmacBytes(kDate, region);
+    final kService = _hmacBytes(kRegion, 's3');
+    return _hmacBytes(kService, 'aws4_request');
+  }
+
+  Uint8List _hmacBytes(List<int> key, String message) {
+    return Uint8List.fromList(
+      Hmac(sha256, key).convert(utf8.encode(message)).bytes,
+    );
+  }
+
+  String _hmacHex(List<int> key, String message) {
+    return Hmac(sha256, key).convert(utf8.encode(message)).toString();
+  }
+
+  String _canonicalUri(Uri uri) {
+    if (uri.pathSegments.isEmpty) {
+      return '/';
+    }
+    return '/${uri.pathSegments.map(_awsEncode).join('/')}';
+  }
+
+  String _awsEncode(String value) {
+    return Uri.encodeComponent(
+      value,
+    ).replaceAll('+', '%20').replaceAll('*', '%2A').replaceAll('%7E', '~');
+  }
+
+  String _dateStamp(DateTime dateTime) {
+    return '${dateTime.year.toString().padLeft(4, '0')}'
+        '${dateTime.month.toString().padLeft(2, '0')}'
+        '${dateTime.day.toString().padLeft(2, '0')}';
+  }
+
+  String _amzDate(DateTime dateTime) {
+    return '${_dateStamp(dateTime)}T'
+        '${dateTime.hour.toString().padLeft(2, '0')}'
+        '${dateTime.minute.toString().padLeft(2, '0')}'
+        '${dateTime.second.toString().padLeft(2, '0')}Z';
+  }
+
+  void close() {
+    _httpClient.close();
+  }
+}
