@@ -1,30 +1,32 @@
 # Audio Dashcam
 
-Flutter Android/iOS app for continuous rolling audio capture. It records short `.m4a` segments, keeps the most recent local window on-device, and uploads segments to an S3-compatible bucket for a longer cloud window.
+Flutter Android/iOS app for continuous rolling audio capture. It keeps one microphone stream open, writes short overlapped `.wav` segments, keeps the most recent local window on-device, and uploads segments through either the sound-recorder backend or a direct S3-compatible fallback.
 
 ## Defaults
 
 - Local retention: 50 hours
 - Cloud retention: 500 hours
 - Segment length: 1 minute
-- Encoding: AAC-LC `.m4a`, mono, 16 kHz, 64 kbps
-- Provider support: AWS S3 / S3-compatible PUT and DELETE is implemented. Google Drive, OneDrive, and iCloud Drive are selectable in the UI as saved configuration targets, but upload adapters are still placeholders.
+- Overlap: 2 seconds at the start of every segment after the first
+- Encoding: PCM16 `.wav`, mono, 16 kHz, about 256 kbps
+- Provider support: the Rust backend at `~/codes/ores/k8s-cluster/remote/deployments/dd-sound-recorder-rs` can issue presigned upload URLs and fan out cloud copy jobs for S3, Google Drive, Microsoft OneDrive, and client-managed iCloud. Direct AWS S3 / S3-compatible PUT and DELETE remains available as a fallback only when S3 is selected.
+- UI: Home, Playback, and Configure screens.
 
 ## Storage Math
 
-Audio size is controlled by bitrate:
+Audio size is controlled by bitrate. Continuous sample-accurate chunking currently records PCM16 WAV:
 
 ```text
 bytes = bitrate_bits_per_second / 8 * seconds
 ```
 
-At the default 64 kbps:
+At the default 16 kHz mono PCM16 setting:
 
-- 1 minute is about 480 KB before container overhead.
-- 50 hours is about 1.44 GB.
-- 500 hours is about 14.4 GB.
+- 1 minute is about 1.92 MB before the small WAV header and overlap overhead.
+- 50 hours is about 5.76 GB.
+- 500 hours is about 57.6 GB.
 
-At 128 kbps, 500 hours is about 28.8 GB.
+Compressed AAC at 64 kbps would be about 14.4 GB for 500 hours, but stop/start encoder file rotation cannot guarantee sample-continuous minute boundaries the way PCM stream chunking can.
 
 ## Runtime Notes
 
@@ -32,11 +34,15 @@ At 128 kbps, 500 hours is about 28.8 GB.
 - On Android 11+, microphone capture must be started while the app is foregrounded. After the foreground microphone service is running, the app can move to the background and continue recording under the visible notification. The app does not try to auto-start microphone capture from boot or from a background-only state.
 - Android app backup is disabled so app-local audio and cloud configuration are not copied into device backups.
 - iOS uses microphone permission and the `audio` background mode. iOS will still stop capture if the user force-quits the app or the OS terminates it.
+- Segment boundaries are sample-counted. Playback trims the duplicate overlap with `just_audio` clipping so local playback does not repeat the overlap.
 - Local files are stored inside the app support directory. The segment index is written atomically, and corrupt index files are quarantined instead of crashing startup. Old local files are deleted only after they are uploaded, so failed uploads do not silently discard audio.
-- Cloud retention deletes S3 objects older than the configured cloud window when credentials are available.
+- Segments persisted as `uploading` are retried on the next upload drain, so a crash during upload does not strand them forever.
+- Backend uploads create a server upload session, presign each segment, PUT the WAV file to the signed URL, then mark the segment complete.
+- Alert requests can ask the backend to email a listening link 20 seconds before a manual or commotion trigger. The app queues alerts until matching uploaded audio is available, and the backend rejects alerts that do not overlap uploaded retained segments. The backend exposes `POST /api/mobile/v1/alerts` and `/listen/:alert_id`.
+- The backend and signed upload URLs must use HTTPS except for localhost development. Signed upload responses are accepted only for `PUT`, and unsafe signed headers are rejected.
 - Direct AWS S3 uploads require HTTPS and lowercase DNS-safe bucket names using letters, numbers, and hyphens. Custom S3-compatible endpoints must also use HTTPS.
 - S3 uploads and deletes time out instead of hanging the queue indefinitely.
-- S3 access keys, secret keys, and session tokens are stored with Flutter Secure Storage using Android secure storage and non-migrating iOS keychain accessibility.
+- Backend device tokens, S3 access keys, secret keys, and session tokens are stored with Flutter Secure Storage using Android secure storage and non-migrating iOS keychain accessibility.
 - For production, prefer temporary scoped credentials or a presigned-upload broker over long-lived AWS keys on the device.
 
 ## S3 IAM Shape
@@ -69,7 +75,16 @@ Run on a configured device:
 /Users/maca5/development/flutter/bin/flutter run
 ```
 
-This machine currently needs Android SDK setup for Android builds, and full Xcode plus CocoaPods for iOS builds.
+Install on a physical Android phone over Wi-Fi:
+
+- Enable Developer options and Wireless debugging on the phone.
+- Pair once with `adb pair PHONE_PAIRING_IP:PORT` using the 6-digit pairing code.
+- Connect with `adb connect PHONE_ADB_IP:PORT`.
+- Build/install with `/Users/maca5/development/flutter/bin/flutter install -d PHONE_ADB_IP:PORT`.
+
+Being on the same Wi-Fi is not enough by itself; Android requires ADB authorization.
+
+Android SDK/JDK are configured on this machine. iOS still needs full Xcode plus CocoaPods before local iOS builds can be verified.
 
 ## Emulator Validation
 
@@ -80,9 +95,10 @@ Verified on that emulator:
 - Debug APK builds and installs.
 - `RECORD_AUDIO`, `POST_NOTIFICATIONS`, `FOREGROUND_SERVICE`, and `FOREGROUND_SERVICE_MICROPHONE` are declared/granted.
 - Starting capture from the foreground creates an Android foreground service with microphone type `0x00000080`.
-- After sending the app Home, the foreground service remained alive past multiple one-minute segment rotations.
-- `.m4a` segment files were written under the app sandbox at roughly 489 KB per minute, matching the default 64 kbps encoding.
-- `segments.v1.json` was updated with closed segment metadata.
+- After sending the app Home, the foreground service remained alive past multiple one-minute segment rotations, and Android app-ops reported `RECORD_AUDIO` running.
+- `.wav` segment files were written under the app sandbox. The first one-minute file was 1,920,044 bytes; the second file was 1,984,044 bytes because it includes the configured 2-second overlap.
+- `segments.v1.json` was updated with sample timeline metadata: sequence 0 ended at sample 960000, sequence 1 started at sample 960000, and sequence 1 stored 32000 overlap samples.
+- Stopping recording finalized the active `.wav.part` file and removed the foreground service.
 
 Observed emulator limitation:
 

@@ -20,6 +20,16 @@ class RecordingSegment {
     required this.endedAtUtc,
     required this.byteSize,
     required this.uploadStatus,
+    this.captureSessionId = '',
+    this.sequence = 0,
+    this.sampleRate = 0,
+    this.channels = 0,
+    this.startSample = 0,
+    this.sampleCount = 0,
+    this.storedSampleCount = 0,
+    this.overlapSamples = 0,
+    this.container = '',
+    this.codec = '',
     this.localPath,
     this.remoteKey,
     this.uploadedAtUtc,
@@ -29,6 +39,16 @@ class RecordingSegment {
   final String id;
   final DateTime startedAtUtc;
   final DateTime endedAtUtc;
+  final String captureSessionId;
+  final int sequence;
+  final int sampleRate;
+  final int channels;
+  final int startSample;
+  final int sampleCount;
+  final int storedSampleCount;
+  final int overlapSamples;
+  final String container;
+  final String codec;
   final String? localPath;
   final int byteSize;
   final SegmentUploadStatus uploadStatus;
@@ -38,6 +58,49 @@ class RecordingSegment {
 
   Duration get duration => endedAtUtc.difference(startedAtUtc);
 
+  bool get hasSampleTimeline =>
+      sampleRate > 0 && channels > 0 && sampleCount > 0;
+
+  int get endSampleExclusive => startSample + sampleCount;
+
+  int get storedStartSample => startSample - overlapSamples;
+
+  int get effectiveStoredSampleCount =>
+      storedSampleCount > 0 ? storedSampleCount : sampleCount + overlapSamples;
+
+  Duration get trimStart => _samplesToDuration(overlapSamples);
+
+  Duration get canonicalDuration =>
+      hasSampleTimeline ? _samplesToDuration(sampleCount) : duration;
+
+  String get fileExtension {
+    final path = localPath;
+    if (path != null) {
+      final dot = path.lastIndexOf('.');
+      if (dot >= 0 && dot < path.length - 1) {
+        return path.substring(dot + 1).toLowerCase();
+      }
+    }
+    if (container == 'wav') {
+      return 'wav';
+    }
+    if (container == 'raw') {
+      return 'pcm';
+    }
+    return 'm4a';
+  }
+
+  String get contentType {
+    switch (fileExtension) {
+      case 'wav':
+        return 'audio/wav';
+      case 'pcm':
+        return 'application/octet-stream';
+      default:
+        return 'audio/mp4';
+    }
+  }
+
   bool get isLocal => localPath != null && localPath!.isNotEmpty;
 
   bool get isUploaded => uploadStatus == SegmentUploadStatus.uploaded;
@@ -46,6 +109,16 @@ class RecordingSegment {
     String? id,
     DateTime? startedAtUtc,
     DateTime? endedAtUtc,
+    String? captureSessionId,
+    int? sequence,
+    int? sampleRate,
+    int? channels,
+    int? startSample,
+    int? sampleCount,
+    int? storedSampleCount,
+    int? overlapSamples,
+    String? container,
+    String? codec,
     Object? localPath = _unset,
     int? byteSize,
     SegmentUploadStatus? uploadStatus,
@@ -57,6 +130,16 @@ class RecordingSegment {
       id: id ?? this.id,
       startedAtUtc: startedAtUtc ?? this.startedAtUtc,
       endedAtUtc: endedAtUtc ?? this.endedAtUtc,
+      captureSessionId: captureSessionId ?? this.captureSessionId,
+      sequence: sequence ?? this.sequence,
+      sampleRate: sampleRate ?? this.sampleRate,
+      channels: channels ?? this.channels,
+      startSample: startSample ?? this.startSample,
+      sampleCount: sampleCount ?? this.sampleCount,
+      storedSampleCount: storedSampleCount ?? this.storedSampleCount,
+      overlapSamples: overlapSamples ?? this.overlapSamples,
+      container: container ?? this.container,
+      codec: codec ?? this.codec,
       localPath: identical(localPath, _unset)
           ? this.localPath
           : localPath as String?,
@@ -77,6 +160,16 @@ class RecordingSegment {
       'id': id,
       'startedAtUtc': startedAtUtc.toIso8601String(),
       'endedAtUtc': endedAtUtc.toIso8601String(),
+      'captureSessionId': captureSessionId,
+      'sequence': sequence,
+      'sampleRate': sampleRate,
+      'channels': channels,
+      'startSample': startSample,
+      'sampleCount': sampleCount,
+      'storedSampleCount': storedSampleCount,
+      'overlapSamples': overlapSamples,
+      'container': container,
+      'codec': codec,
       'localPath': localPath,
       'byteSize': byteSize,
       'uploadStatus': uploadStatus.name,
@@ -91,6 +184,16 @@ class RecordingSegment {
       id: json['id'] as String,
       startedAtUtc: DateTime.parse(json['startedAtUtc'] as String).toUtc(),
       endedAtUtc: DateTime.parse(json['endedAtUtc'] as String).toUtc(),
+      captureSessionId: json['captureSessionId'] as String? ?? '',
+      sequence: _asInt(json['sequence']),
+      sampleRate: _asInt(json['sampleRate']),
+      channels: _asInt(json['channels']),
+      startSample: _asInt(json['startSample']),
+      sampleCount: _asInt(json['sampleCount']),
+      storedSampleCount: _asInt(json['storedSampleCount']),
+      overlapSamples: _asInt(json['overlapSamples']),
+      container: json['container'] as String? ?? '',
+      codec: json['codec'] as String? ?? '',
       localPath: json['localPath'] as String?,
       byteSize: _asInt(json['byteSize']),
       uploadStatus: SegmentUploadStatus.fromName(
@@ -105,6 +208,13 @@ class RecordingSegment {
   }
 
   static const _unset = Object();
+
+  Duration _samplesToDuration(int samples) {
+    if (sampleRate <= 0 || samples <= 0) {
+      return Duration.zero;
+    }
+    return Duration(microseconds: samples * 1000000 ~/ sampleRate);
+  }
 
   static int _asInt(Object? value) {
     if (value is int) {

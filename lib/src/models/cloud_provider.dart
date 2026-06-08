@@ -17,7 +17,9 @@ enum CloudProvider {
     }
   }
 
-  bool get isImplemented => this == CloudProvider.s3;
+  bool get requiresBackend => this != CloudProvider.s3;
+
+  bool get isImplemented => true;
 
   static CloudProvider fromName(String? name) {
     return CloudProvider.values.firstWhere(

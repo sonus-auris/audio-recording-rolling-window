@@ -71,7 +71,10 @@ class SegmentIndex {
     await saveSegments(segments);
   }
 
-  Future<String> createSegmentPath(DateTime startedAtUtc) async {
+  Future<String> createSegmentPath(
+    DateTime startedAtUtc, {
+    String extension = '.m4a',
+  }) async {
     final dir = await segmentsDirectory;
     final year = startedAtUtc.year.toString().padLeft(4, '0');
     final month = startedAtUtc.month.toString().padLeft(2, '0');
@@ -81,7 +84,13 @@ class SegmentIndex {
     if (!await nestedDir.exists()) {
       await nestedDir.create(recursive: true);
     }
-    return p.join(nestedDir.path, '${safeSegmentId(startedAtUtc)}.m4a');
+    final normalizedExtension = extension.startsWith('.')
+        ? extension
+        : '.$extension';
+    return p.join(
+      nestedDir.path,
+      '${safeSegmentId(startedAtUtc)}$normalizedExtension',
+    );
   }
 
   Future<List<RecordingSegment>> recoverOrphanedLocalSegments({
@@ -101,7 +110,9 @@ class SegmentIndex {
       recursive: true,
       followLinks: false,
     )) {
-      if (entity is! File || p.extension(entity.path).toLowerCase() != '.m4a') {
+      final extension = p.extension(entity.path).toLowerCase();
+      if (entity is! File ||
+          (extension != '.m4a' && extension != '.wav' && extension != '.pcm')) {
         continue;
       }
       if (knownPaths.contains(p.normalize(entity.path))) {

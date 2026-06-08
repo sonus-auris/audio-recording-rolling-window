@@ -55,7 +55,7 @@ class S3StorageClient {
         config: config,
         secrets: secrets,
         payloadHash: payloadHash,
-        extraHeaders: const {'content-type': 'audio/mp4'},
+        extraHeaders: {'content-type': segment.contentType},
       );
       final response = await _httpClient
           .put(uri, headers: headers, body: bytes)
@@ -129,7 +129,7 @@ class S3StorageClient {
       started.month.toString().padLeft(2, '0'),
       started.day.toString().padLeft(2, '0'),
       started.hour.toString().padLeft(2, '0'),
-      '${segment.id}.m4a',
+      '${segment.id}.${segment.fileExtension}',
     ];
     return parts.join('/');
   }

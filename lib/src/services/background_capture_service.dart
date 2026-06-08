@@ -1,9 +1,19 @@
+// ignore_for_file: prefer_initializing_formals
+
 import 'dart:io';
 
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
+import 'diagnostic_log.dart';
+
 class BackgroundCaptureService {
+  BackgroundCaptureService({DiagnosticLog? diagnostics})
+    : _diagnostics = diagnostics;
+
+  final DiagnosticLog? _diagnostics;
+
   void init() {
+    _diagnostics?.add('Initializing Android foreground task options.');
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'audio_dashcam_capture',
@@ -30,27 +40,46 @@ class BackgroundCaptureService {
 
   Future<String?> start() async {
     if (!Platform.isAndroid) {
+      _diagnostics?.add('Foreground service skipped: platform is not Android.');
       return null;
     }
-    final notificationPermission =
-        await FlutterForegroundTask.checkNotificationPermission();
-    if (notificationPermission != NotificationPermission.granted) {
-      await FlutterForegroundTask.requestNotificationPermission();
-    }
-    if (await FlutterForegroundTask.isRunningService) {
+    try {
+      _diagnostics?.add('Checking Android notification permission.');
+      final notificationPermission =
+          await FlutterForegroundTask.checkNotificationPermission();
+      _diagnostics?.add('Notification permission: $notificationPermission.');
+      if (notificationPermission != NotificationPermission.granted) {
+        _diagnostics?.add('Requesting notification permission.');
+        await FlutterForegroundTask.requestNotificationPermission();
+      }
+      if (await FlutterForegroundTask.isRunningService) {
+        _diagnostics?.add('Foreground service already running.');
+        return null;
+      }
+      _diagnostics?.add('Starting microphone foreground service.');
+      final result = await FlutterForegroundTask.startService(
+        serviceId: 500,
+        serviceTypes: const [ForegroundServiceTypes.microphone],
+        notificationTitle: 'Audio Dashcam is recording',
+        notificationText: 'Rolling local window and cloud upload are active.',
+        callback: audioDashcamForegroundCallback,
+      );
+      if (result is ServiceRequestFailure) {
+        if (await FlutterForegroundTask.isRunningService) {
+          _diagnostics?.add(
+            'Foreground service reported failure but is running.',
+          );
+          return null;
+        }
+        _diagnostics?.add('Foreground service failed: ${result.error}.');
+        return _friendlyStartError(result.error);
+      }
+      _diagnostics?.add('Foreground service started.');
       return null;
+    } catch (error) {
+      _diagnostics?.add('Foreground service threw: $error.');
+      return _friendlyStartError(error);
     }
-    final result = await FlutterForegroundTask.startService(
-      serviceId: 500,
-      serviceTypes: const [ForegroundServiceTypes.microphone],
-      notificationTitle: 'Audio Dashcam is recording',
-      notificationText: 'Rolling local window and cloud upload are active.',
-      callback: audioDashcamForegroundCallback,
-    );
-    if (result is ServiceRequestFailure) {
-      return result.error.toString();
-    }
-    return null;
   }
 
   Future<void> stop() async {
@@ -58,9 +87,20 @@ class BackgroundCaptureService {
       return;
     }
     if (await FlutterForegroundTask.isRunningService) {
+      _diagnostics?.add('Stopping foreground service.');
       await FlutterForegroundTask.stopService();
+    } else {
+      _diagnostics?.add('Foreground service stop skipped: not running.');
     }
   }
+}
+
+String _friendlyStartError(Object error) {
+  final text = error.toString();
+  if (text.contains('ServiceTimeoutException')) {
+    return 'Android foreground service timed out. Recording can run while the app stays open, but background recording is not protected yet.';
+  }
+  return 'Android foreground service failed: $text';
 }
 
 @pragma('vm:entry-point')

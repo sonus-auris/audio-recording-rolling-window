@@ -50,10 +50,32 @@ class _AudioDashcamRootState extends State<AudioDashcamRoot> {
             seedColor: const Color(0xFF287C66),
             brightness: Brightness.light,
           ),
+          scaffoldBackgroundColor: const Color(0xFFF6F8F7),
           useMaterial3: true,
+          appBarTheme: const AppBarTheme(
+            centerTitle: false,
+            elevation: 0,
+            scrolledUnderElevation: 0,
+          ),
           inputDecorationTheme: const InputDecorationTheme(
             border: OutlineInputBorder(),
             isDense: true,
+          ),
+          filledButtonTheme: FilledButtonThemeData(
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(0, 44),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+          ),
+          outlinedButtonTheme: OutlinedButtonThemeData(
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size(0, 44),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
           ),
           cardTheme: const CardThemeData(margin: EdgeInsets.zero, elevation: 0),
         ),
@@ -116,9 +138,11 @@ class _SettingsPageState extends State<SettingsPage> {
   final _deviceRetentionController = TextEditingController();
   final _cloudRetentionController = TextEditingController();
   final _segmentMinutesController = TextEditingController();
-  final _bitRateController = TextEditingController();
+  final _overlapSecondsController = TextEditingController();
   final _sampleRateController = TextEditingController();
   final _channelsController = TextEditingController();
+  final _backendUrlController = TextEditingController();
+  final _backendDeviceTokenController = TextEditingController();
   final _s3BucketController = TextEditingController();
   final _s3RegionController = TextEditingController();
   final _s3PrefixController = TextEditingController();
@@ -130,6 +154,7 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _syncedDeviceId;
   CloudProvider _selectedProvider = CloudProvider.s3;
   bool _uploadEnabled = true;
+  int _selectedIndex = 0;
 
   @override
   void dispose() {
@@ -137,9 +162,11 @@ class _SettingsPageState extends State<SettingsPage> {
       _deviceRetentionController,
       _cloudRetentionController,
       _segmentMinutesController,
-      _bitRateController,
+      _overlapSecondsController,
       _sampleRateController,
       _channelsController,
+      _backendUrlController,
+      _backendDeviceTokenController,
       _s3BucketController,
       _s3RegionController,
       _s3PrefixController,
@@ -177,95 +204,97 @@ class _SettingsPageState extends State<SettingsPage> {
             ],
           ),
           body: SafeArea(
-            child: Form(
-              key: _formKey,
-              child: ListView(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
-                children: [
-                  if (viewModel.message != null)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 12),
-                      child: MaterialBanner(
-                        content: Text(viewModel.message!),
-                        leading: const Icon(Icons.info_outline),
-                        actions: [
-                          TextButton(
-                            onPressed: widget.controller.clearMessage,
-                            child: const Text('Dismiss'),
-                          ),
-                        ],
+            child: Column(
+              children: [
+                if (viewModel.message != null)
+                  MaterialBanner(
+                    content: Text(viewModel.message!),
+                    leading: const Icon(Icons.info_outline),
+                    actions: [
+                      TextButton(
+                        onPressed: widget.controller.clearMessage,
+                        child: const Text('Dismiss'),
                       ),
-                    ),
-                  _StatusSection(
-                    viewModel: viewModel,
-                    onStart: widget.controller.startRecording,
-                    onStop: widget.controller.stopRecording,
-                    onPlay: widget.controller.playLocalWindow,
-                    onPausePlayback: widget.controller.pausePlayback,
-                    onStopPlayback: widget.controller.stopPlayback,
+                    ],
                   ),
-                  const SizedBox(height: 16),
-                  LayoutBuilder(
-                    builder: (context, constraints) {
-                      final wide = constraints.maxWidth >= 840;
-                      final children = [
-                        _CaptureSection(
-                          deviceId: viewModel.config.deviceId,
-                          uploadEnabled: _uploadEnabled,
-                          onUploadEnabledChanged: (value) =>
-                              setState(() => _uploadEnabled = value),
-                          deviceRetentionController: _deviceRetentionController,
-                          cloudRetentionController: _cloudRetentionController,
-                          segmentMinutesController: _segmentMinutesController,
-                          bitRateController: _bitRateController,
-                          sampleRateController: _sampleRateController,
-                          channelsController: _channelsController,
-                        ),
-                        _CloudSection(
-                          selectedProvider: _selectedProvider,
-                          onProviderChanged: (provider) =>
-                              setState(() => _selectedProvider = provider),
-                          s3BucketController: _s3BucketController,
-                          s3RegionController: _s3RegionController,
-                          s3PrefixController: _s3PrefixController,
-                          s3EndpointController: _s3EndpointController,
-                          s3AccessKeyController: _s3AccessKeyController,
-                          s3SecretKeyController: _s3SecretKeyController,
-                          s3SessionTokenController: _s3SessionTokenController,
-                        ),
-                      ];
-                      if (!wide) {
-                        return Column(
-                          children: [
-                            children.first,
-                            const SizedBox(height: 16),
-                            children.last,
-                          ],
-                        );
-                      }
-                      return Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Expanded(child: children.first),
-                          const SizedBox(width: 16),
-                          Expanded(child: children.last),
-                        ],
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  FilledButton.icon(
-                    onPressed: () => _save(viewModel),
-                    icon: const Icon(Icons.save),
-                    label: const Text('Save Configuration'),
-                  ),
-                ],
-              ),
+                Expanded(child: _selectedBody(viewModel)),
+              ],
             ),
+          ),
+          bottomNavigationBar: NavigationBar(
+            selectedIndex: _selectedIndex,
+            onDestinationSelected: (index) =>
+                setState(() => _selectedIndex = index),
+            destinations: const [
+              NavigationDestination(
+                icon: Icon(Icons.dashboard_outlined),
+                selectedIcon: Icon(Icons.dashboard),
+                label: 'Home',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.graphic_eq),
+                selectedIcon: Icon(Icons.graphic_eq),
+                label: 'Playback',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.tune),
+                selectedIcon: Icon(Icons.tune),
+                label: 'Configure',
+              ),
+            ],
           ),
         );
       },
     );
+  }
+
+  Widget _selectedBody(AppViewModel viewModel) {
+    switch (_selectedIndex) {
+      case 1:
+        return _PlaybackView(
+          viewModel: viewModel,
+          onPlay: widget.controller.playLocalWindow,
+          onPausePlayback: widget.controller.pausePlayback,
+          onStopPlayback: widget.controller.stopPlayback,
+          onSendAlert: widget.controller.sendManualAlert,
+        );
+      case 2:
+        return Form(
+          key: _formKey,
+          child: _ConfigureView(
+            viewModel: viewModel,
+            selectedProvider: _selectedProvider,
+            uploadEnabled: _uploadEnabled,
+            onUploadEnabledChanged: (value) =>
+                setState(() => _uploadEnabled = value),
+            onProviderChanged: (provider) =>
+                setState(() => _selectedProvider = provider),
+            onSave: () => _save(viewModel),
+            deviceRetentionController: _deviceRetentionController,
+            cloudRetentionController: _cloudRetentionController,
+            segmentMinutesController: _segmentMinutesController,
+            overlapSecondsController: _overlapSecondsController,
+            sampleRateController: _sampleRateController,
+            channelsController: _channelsController,
+            backendUrlController: _backendUrlController,
+            backendDeviceTokenController: _backendDeviceTokenController,
+            s3BucketController: _s3BucketController,
+            s3RegionController: _s3RegionController,
+            s3PrefixController: _s3PrefixController,
+            s3EndpointController: _s3EndpointController,
+            s3AccessKeyController: _s3AccessKeyController,
+            s3SecretKeyController: _s3SecretKeyController,
+            s3SessionTokenController: _s3SessionTokenController,
+          ),
+        );
+      default:
+        return _HomeView(
+          viewModel: viewModel,
+          onStart: widget.controller.startRecording,
+          onStop: widget.controller.stopRecording,
+          onSendAlert: widget.controller.sendManualAlert,
+        );
+    }
   }
 
   void _syncForm(AppViewModel viewModel) {
@@ -277,9 +306,11 @@ class _SettingsPageState extends State<SettingsPage> {
     _deviceRetentionController.text = config.deviceRetentionHours.toString();
     _cloudRetentionController.text = config.cloudRetentionHours.toString();
     _segmentMinutesController.text = config.segmentMinutes.toString();
-    _bitRateController.text = config.bitRate.toString();
+    _overlapSecondsController.text = config.overlapSeconds.toString();
     _sampleRateController.text = config.sampleRate.toString();
     _channelsController.text = config.channels.toString();
+    _backendUrlController.text = config.backendBaseUrl;
+    _backendDeviceTokenController.text = secrets.backendDeviceToken;
     _s3BucketController.text = config.s3Bucket;
     _s3RegionController.text = config.s3Region;
     _s3PrefixController.text = config.s3Prefix;
@@ -300,11 +331,12 @@ class _SettingsPageState extends State<SettingsPage> {
       deviceRetentionHours: _parseInt(_deviceRetentionController.text, 50),
       cloudRetentionHours: _parseInt(_cloudRetentionController.text, 500),
       segmentMinutes: _parseInt(_segmentMinutesController.text, 1),
-      bitRate: _parseInt(_bitRateController.text, 64000),
+      overlapSeconds: _parseInt(_overlapSecondsController.text, 2),
       sampleRate: _parseInt(_sampleRateController.text, 16000),
       channels: _parseInt(_channelsController.text, 1),
       uploadEnabled: _uploadEnabled,
       cloudProvider: _selectedProvider,
+      backendBaseUrl: _backendUrlController.text,
       s3Bucket: _s3BucketController.text,
       s3Region: _s3RegionController.text,
       s3Prefix: _s3PrefixController.text,
@@ -314,6 +346,7 @@ class _SettingsPageState extends State<SettingsPage> {
       s3AccessKeyId: _s3AccessKeyController.text,
       s3SecretAccessKey: _s3SecretKeyController.text,
       s3SessionToken: _s3SessionTokenController.text,
+      backendDeviceToken: _backendDeviceTokenController.text,
     );
     await widget.controller.saveConfig(config);
     await widget.controller.saveSecrets(secrets);
@@ -325,46 +358,337 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 }
 
-class _StatusSection extends StatelessWidget {
-  const _StatusSection({
+class _HomeView extends StatelessWidget {
+  const _HomeView({
     required this.viewModel,
     required this.onStart,
     required this.onStop,
-    required this.onPlay,
-    required this.onPausePlayback,
-    required this.onStopPlayback,
+    required this.onSendAlert,
   });
 
   final AppViewModel viewModel;
   final VoidCallback onStart;
   final VoidCallback onStop;
+  final VoidCallback onSendAlert;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+      children: [
+        _StatusSection(
+          viewModel: viewModel,
+          onStart: onStart,
+          onStop: onStop,
+          onSendAlert: onSendAlert,
+        ),
+        const SizedBox(height: 16),
+        _DiagnosticsSection(entries: viewModel.diagnosticEntries),
+      ],
+    );
+  }
+}
+
+class _PlaybackView extends StatelessWidget {
+  const _PlaybackView({
+    required this.viewModel,
+    required this.onPlay,
+    required this.onPausePlayback,
+    required this.onStopPlayback,
+    required this.onSendAlert,
+  });
+
+  final AppViewModel viewModel;
   final VoidCallback onPlay;
   final VoidCallback onPausePlayback;
   final VoidCallback onStopPlayback;
+  final VoidCallback onSendAlert;
+
+  @override
+  Widget build(BuildContext context) {
+    final playback = viewModel.playback;
+    final recent = viewModel.localSegments.reversed.take(12).toList();
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+      children: [
+        _Section(
+          title: 'Playback',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: viewModel.localSegments.isEmpty ? null : onPlay,
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text('Play Local Window'),
+                  ),
+                  if (playback.isPlaying)
+                    IconButton.outlined(
+                      tooltip: 'Pause playback',
+                      onPressed: onPausePlayback,
+                      icon: const Icon(Icons.pause),
+                    ),
+                  IconButton.outlined(
+                    tooltip: 'Stop playback',
+                    onPressed: playback.isLoaded ? onStopPlayback : null,
+                    icon: const Icon(Icons.stop_circle_outlined),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: onSendAlert,
+                    icon: const Icon(Icons.notification_important_outlined),
+                    label: const Text('Send Alert'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _MetricChip(
+                    icon: Icons.timer_outlined,
+                    label: 'Position',
+                    value: _formatDuration(playback.position),
+                  ),
+                  _MetricChip(
+                    icon: Icons.timeline,
+                    label: 'Gaps',
+                    value: viewModel.continuityGapCount.toString(),
+                  ),
+                  _MetricChip(
+                    icon: Icons.join_inner,
+                    label: 'Overlapped',
+                    value: viewModel.overlappedSegments.toString(),
+                  ),
+                ],
+              ),
+              if (playback.error != null) ...[
+                const SizedBox(height: 12),
+                Text(
+                  playback.error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        _Section(
+          title: 'Local Segments',
+          child: Column(
+            children: [
+              if (recent.isEmpty)
+                _InlineState(
+                  icon: Icons.hourglass_empty,
+                  text: viewModel.recorder.isRecording
+                      ? 'First segment is still recording.'
+                      : 'No local segments yet.',
+                )
+              else
+                for (final segment in recent)
+                  _SegmentListItem(
+                    title: segment.startedAtUtc.toLocal().toString(),
+                    subtitle:
+                        '${_formatDuration(segment.canonicalDuration)}'
+                        ' / overlap ${_formatDuration(segment.trimStart)}',
+                    trailing: StorageEstimate.formatBytes(segment.byteSize),
+                  ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _formatDuration(Duration duration) {
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
+  }
+}
+
+class _ConfigureView extends StatelessWidget {
+  const _ConfigureView({
+    required this.viewModel,
+    required this.selectedProvider,
+    required this.uploadEnabled,
+    required this.onUploadEnabledChanged,
+    required this.onProviderChanged,
+    required this.onSave,
+    required this.deviceRetentionController,
+    required this.cloudRetentionController,
+    required this.segmentMinutesController,
+    required this.overlapSecondsController,
+    required this.sampleRateController,
+    required this.channelsController,
+    required this.backendUrlController,
+    required this.backendDeviceTokenController,
+    required this.s3BucketController,
+    required this.s3RegionController,
+    required this.s3PrefixController,
+    required this.s3EndpointController,
+    required this.s3AccessKeyController,
+    required this.s3SecretKeyController,
+    required this.s3SessionTokenController,
+  });
+
+  final AppViewModel viewModel;
+  final CloudProvider selectedProvider;
+  final bool uploadEnabled;
+  final ValueChanged<bool> onUploadEnabledChanged;
+  final ValueChanged<CloudProvider> onProviderChanged;
+  final VoidCallback onSave;
+  final TextEditingController deviceRetentionController;
+  final TextEditingController cloudRetentionController;
+  final TextEditingController segmentMinutesController;
+  final TextEditingController overlapSecondsController;
+  final TextEditingController sampleRateController;
+  final TextEditingController channelsController;
+  final TextEditingController backendUrlController;
+  final TextEditingController backendDeviceTokenController;
+  final TextEditingController s3BucketController;
+  final TextEditingController s3RegionController;
+  final TextEditingController s3PrefixController;
+  final TextEditingController s3EndpointController;
+  final TextEditingController s3AccessKeyController;
+  final TextEditingController s3SecretKeyController;
+  final TextEditingController s3SessionTokenController;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+      children: [
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final wide = constraints.maxWidth >= 840;
+            final children = [
+              _CaptureSection(
+                deviceId: viewModel.config.deviceId,
+                uploadEnabled: uploadEnabled,
+                onUploadEnabledChanged: onUploadEnabledChanged,
+                deviceRetentionController: deviceRetentionController,
+                cloudRetentionController: cloudRetentionController,
+                segmentMinutesController: segmentMinutesController,
+                overlapSecondsController: overlapSecondsController,
+                sampleRateController: sampleRateController,
+                channelsController: channelsController,
+              ),
+              _CloudSection(
+                selectedProvider: selectedProvider,
+                onProviderChanged: onProviderChanged,
+                backendUrlController: backendUrlController,
+                backendDeviceTokenController: backendDeviceTokenController,
+                s3BucketController: s3BucketController,
+                s3RegionController: s3RegionController,
+                s3PrefixController: s3PrefixController,
+                s3EndpointController: s3EndpointController,
+                s3AccessKeyController: s3AccessKeyController,
+                s3SecretKeyController: s3SecretKeyController,
+                s3SessionTokenController: s3SessionTokenController,
+              ),
+            ];
+            if (!wide) {
+              return Column(
+                children: [
+                  children.first,
+                  const SizedBox(height: 16),
+                  children.last,
+                ],
+              );
+            }
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(child: children.first),
+                const SizedBox(width: 16),
+                Expanded(child: children.last),
+              ],
+            );
+          },
+        ),
+        const SizedBox(height: 16),
+        FilledButton.icon(
+          onPressed: onSave,
+          icon: const Icon(Icons.save),
+          label: const Text('Save Configuration'),
+        ),
+      ],
+    );
+  }
+}
+
+class _StatusSection extends StatelessWidget {
+  const _StatusSection({
+    required this.viewModel,
+    required this.onStart,
+    required this.onStop,
+    required this.onSendAlert,
+  });
+
+  final AppViewModel viewModel;
+  final VoidCallback onStart;
+  final VoidCallback onStop;
+  final VoidCallback onSendAlert;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final recorder = viewModel.recorder;
     final peak = ((recorder.peakDb + 60) / 60).clamp(0.0, 1.0);
+    final localCapacitySeconds = viewModel.config.deviceRetentionHours * 3600;
+    final localProgress = localCapacitySeconds <= 0
+        ? 0.0
+        : (viewModel.localWindowDuration.inSeconds / localCapacitySeconds)
+              .clamp(0.0, 1.0);
+    final statusColor = recorder.isRecording
+        ? theme.colorScheme.primary
+        : theme.colorScheme.outline;
     return _Section(
-      title: 'Status',
+      title: 'Live Capture',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(
-                recorder.isRecording ? Icons.mic : Icons.mic_off,
-                color: recorder.isRecording
-                    ? theme.colorScheme.primary
-                    : theme.colorScheme.outline,
+              Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: statusColor.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Icon(
+                  recorder.isRecording ? Icons.mic : Icons.mic_off,
+                  color: statusColor,
+                ),
               ),
               const SizedBox(width: 12),
               Expanded(
-                child: Text(
-                  recorder.isRecording ? 'Recording' : 'Stopped',
-                  style: theme.textTheme.titleLarge,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      recorder.isRecording ? 'Recording' : 'Stopped',
+                      style: theme.textTheme.headlineSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      recorder.isRecording
+                          ? _formatDuration(viewModel.activeRecordingDuration)
+                          : '${viewModel.config.deviceRetentionHours} h local window',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
                 ),
               ),
               if (viewModel.isUploading)
@@ -375,6 +699,19 @@ class _StatusSection extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 12),
+          Row(
+            children: [
+              Text('Input level', style: theme.textTheme.labelLarge),
+              const Spacer(),
+              Text(
+                '${recorder.peakDb.toStringAsFixed(0)} dB',
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
           ClipRRect(
             borderRadius: BorderRadius.circular(4),
             child: LinearProgressIndicator(
@@ -384,14 +721,21 @@ class _StatusSection extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 16),
+          _RetentionBar(
+            label: 'Local retention',
+            value: localProgress,
+            leadingValue: _formatDuration(viewModel.localWindowDuration),
+            trailingValue: '${viewModel.config.deviceRetentionHours} h',
+          ),
+          const SizedBox(height: 16),
           Wrap(
-            spacing: 8,
-            runSpacing: 8,
+            spacing: 10,
+            runSpacing: 10,
             children: [
               _MetricChip(
                 icon: Icons.phone_android,
                 label: 'Local',
-                value: StorageEstimate.formatBytes(viewModel.localBytes),
+                value: StorageEstimate.formatBytes(viewModel.localWindowBytes),
               ),
               _MetricChip(
                 icon: Icons.cloud_done,
@@ -400,9 +744,9 @@ class _StatusSection extends StatelessWidget {
               ),
               _MetricChip(
                 icon: Icons.schedule,
-                label: 'Indexed',
+                label: 'Local window',
                 value: StorageEstimate.formatDurationHours(
-                  viewModel.indexedDuration.inMinutes / 60,
+                  viewModel.localWindowDuration.inSeconds / 3600,
                 ),
               ),
               _MetricChip(
@@ -439,20 +783,9 @@ class _StatusSection extends StatelessWidget {
                 label: const Text('Stop'),
               ),
               OutlinedButton.icon(
-                onPressed: viewModel.localSegments.isEmpty ? null : onPlay,
-                icon: const Icon(Icons.play_arrow),
-                label: const Text('Play Local Window'),
-              ),
-              if (viewModel.playback.isPlaying)
-                IconButton.outlined(
-                  tooltip: 'Pause playback',
-                  onPressed: onPausePlayback,
-                  icon: const Icon(Icons.pause),
-                ),
-              IconButton.outlined(
-                tooltip: 'Stop playback',
-                onPressed: viewModel.playback.isLoaded ? onStopPlayback : null,
-                icon: const Icon(Icons.stop_circle_outlined),
+                onPressed: onSendAlert,
+                icon: const Icon(Icons.notification_important_outlined),
+                label: const Text('Send Alert'),
               ),
             ],
           ),
@@ -470,7 +803,7 @@ class _CaptureSection extends StatelessWidget {
     required this.deviceRetentionController,
     required this.cloudRetentionController,
     required this.segmentMinutesController,
-    required this.bitRateController,
+    required this.overlapSecondsController,
     required this.sampleRateController,
     required this.channelsController,
   });
@@ -481,7 +814,7 @@ class _CaptureSection extends StatelessWidget {
   final TextEditingController deviceRetentionController;
   final TextEditingController cloudRetentionController;
   final TextEditingController segmentMinutesController;
-  final TextEditingController bitRateController;
+  final TextEditingController overlapSecondsController;
   final TextEditingController sampleRateController;
   final TextEditingController channelsController;
 
@@ -514,7 +847,11 @@ class _CaptureSection extends StatelessWidget {
             label: 'Segment minutes',
           ),
           const SizedBox(height: 12),
-          _NumberField(controller: bitRateController, label: 'Bitrate bps'),
+          _NumberField(
+            controller: overlapSecondsController,
+            label: 'Overlap seconds',
+            allowZero: true,
+          ),
           const SizedBox(height: 12),
           Row(
             children: [
@@ -543,6 +880,8 @@ class _CloudSection extends StatelessWidget {
   const _CloudSection({
     required this.selectedProvider,
     required this.onProviderChanged,
+    required this.backendUrlController,
+    required this.backendDeviceTokenController,
     required this.s3BucketController,
     required this.s3RegionController,
     required this.s3PrefixController,
@@ -554,6 +893,8 @@ class _CloudSection extends StatelessWidget {
 
   final CloudProvider selectedProvider;
   final ValueChanged<CloudProvider> onProviderChanged;
+  final TextEditingController backendUrlController;
+  final TextEditingController backendDeviceTokenController;
   final TextEditingController s3BucketController;
   final TextEditingController s3RegionController;
   final TextEditingController s3PrefixController;
@@ -586,14 +927,33 @@ class _CloudSection extends StatelessWidget {
             },
           ),
           const SizedBox(height: 12),
-          if (!selectedProvider.isImplemented)
+          if (selectedProvider.requiresBackend)
             const Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                'This provider can be saved here; uploads currently run through S3.',
+                'This provider uploads through the sound recorder backend.',
               ),
             ),
-          if (!selectedProvider.isImplemented) const SizedBox(height: 12),
+          if (selectedProvider.requiresBackend) const SizedBox(height: 12),
+          TextFormField(
+            controller: backendUrlController,
+            decoration: const InputDecoration(labelText: 'Backend URL'),
+            autocorrect: false,
+            enableSuggestions: false,
+            keyboardType: TextInputType.url,
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: backendDeviceTokenController,
+            decoration: const InputDecoration(
+              labelText: 'Backend device token',
+            ),
+            obscureText: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            keyboardType: TextInputType.visiblePassword,
+          ),
+          const SizedBox(height: 12),
           TextFormField(
             controller: s3BucketController,
             decoration: const InputDecoration(labelText: 'S3 bucket'),
@@ -650,11 +1010,189 @@ class _CloudSection extends StatelessWidget {
   }
 }
 
+class _DiagnosticsSection extends StatelessWidget {
+  const _DiagnosticsSection({required this.entries});
+
+  final List<String> entries;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final recent = entries.take(24).join('\n');
+    final latest = entries.isEmpty ? 'No diagnostics yet.' : entries.first;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: ExpansionTile(
+        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+        collapsedShape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.zero,
+        ),
+        leading: const Icon(Icons.terminal),
+        title: const Text('Diagnostics'),
+        subtitle: Text(latest, maxLines: 1, overflow: TextOverflow.ellipsis),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        children: [
+          Align(
+            alignment: Alignment.centerLeft,
+            child: SelectableText(
+              recent.isEmpty ? 'No diagnostics yet.' : recent,
+              style: theme.textTheme.bodySmall?.copyWith(
+                fontFeatures: const [],
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RetentionBar extends StatelessWidget {
+  const _RetentionBar({
+    required this.label,
+    required this.value,
+    required this.leadingValue,
+    required this.trailingValue,
+  });
+
+  final String label;
+  final double value;
+  final String leadingValue;
+  final String trailingValue;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text(label, style: theme.textTheme.labelLarge),
+            const Spacer(),
+            Text(
+              '$leadingValue / $trailingValue',
+              style: theme.textTheme.labelMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: LinearProgressIndicator(
+            minHeight: 8,
+            value: value,
+            backgroundColor: theme.colorScheme.surfaceContainerHighest,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _SegmentListItem extends StatelessWidget {
+  const _SegmentListItem({
+    required this.title,
+    required this.subtitle,
+    required this.trailing,
+  });
+
+  final String title;
+  final String subtitle;
+  final String trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLowest,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.audio_file_outlined, color: theme.colorScheme.primary),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 2),
+                Text(
+                  subtitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          Text(trailing, style: theme.textTheme.labelLarge),
+        ],
+      ),
+    );
+  }
+}
+
+class _InlineState extends StatelessWidget {
+  const _InlineState({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLowest,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: theme.colorScheme.onSurfaceVariant),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              text,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _NumberField extends StatelessWidget {
-  const _NumberField({required this.controller, required this.label});
+  const _NumberField({
+    required this.controller,
+    required this.label,
+    this.allowZero = false,
+  });
 
   final TextEditingController controller;
   final String label;
+  final bool allowZero;
 
   @override
   Widget build(BuildContext context) {
@@ -664,8 +1202,10 @@ class _NumberField extends StatelessWidget {
       keyboardType: TextInputType.number,
       validator: (value) {
         final parsed = int.tryParse(value?.trim() ?? '');
-        if (parsed == null || parsed <= 0) {
-          return 'Use a positive number';
+        if (parsed == null || parsed < 0 || (!allowZero && parsed == 0)) {
+          return allowZero
+              ? 'Use zero or a positive number'
+              : 'Use a positive number';
         }
         return null;
       },
@@ -717,21 +1257,53 @@ class _MetricChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        border: Border.all(color: theme.colorScheme.outlineVariant),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 18),
-          const SizedBox(width: 8),
-          Text('$label: ', style: theme.textTheme.labelLarge),
-          Text(value),
-        ],
+    return ConstrainedBox(
+      constraints: const BoxConstraints(minWidth: 148, minHeight: 64),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerLowest,
+          border: Border.all(color: theme.colorScheme.outlineVariant),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 20, color: theme.colorScheme.primary),
+            const SizedBox(width: 10),
+            Flexible(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    value,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
+}
+
+String _formatDuration(Duration duration) {
+  final hours = duration.inHours;
+  final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+  return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
 }

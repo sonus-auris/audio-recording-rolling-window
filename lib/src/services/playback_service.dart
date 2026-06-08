@@ -46,12 +46,7 @@ class PlaybackService {
     }
     try {
       await _player.setAudioSources(
-        localSegments
-            .map(
-              (segment) =>
-                  AudioSource.file(segment.localPath!, tag: segment.id),
-            )
-            .toList(),
+        localSegments.map(_sourceForSegment).toList(),
         preload: true,
       );
       _emit(
@@ -82,5 +77,18 @@ class PlaybackService {
     if (!_snapshot.isClosed) {
       _snapshot.add(snapshot);
     }
+  }
+
+  AudioSource _sourceForSegment(RecordingSegment segment) {
+    final file = AudioSource.file(segment.localPath!, tag: segment.id);
+    if (segment.trimStart <= Duration.zero) {
+      return file;
+    }
+    return ClippingAudioSource(
+      child: file,
+      start: segment.trimStart,
+      duration: segment.canonicalDuration,
+      tag: segment.id,
+    );
   }
 }

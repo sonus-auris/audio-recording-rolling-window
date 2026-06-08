@@ -1,5 +1,6 @@
 import '../models/app_config.dart';
 import '../models/cloud_secrets.dart';
+import '../models/cloud_provider.dart';
 import '../models/playback_snapshot.dart';
 import '../models/recorder_snapshot.dart';
 import '../models/recording_segment.dart';
@@ -12,6 +13,7 @@ class AppViewModel {
     required this.segments,
     required this.recorder,
     required this.playback,
+    required this.diagnosticEntries,
     required this.isInitializing,
     required this.isUploading,
     this.message,
@@ -22,12 +24,13 @@ class AppViewModel {
   final List<RecordingSegment> segments;
   final RecorderSnapshot recorder;
   final PlaybackSnapshot playback;
+  final List<String> diagnosticEntries;
   final bool isInitializing;
   final bool isUploading;
   final String? message;
 
   StorageEstimate get estimate => StorageEstimate(
-    bitRate: config.bitRate,
+    bitRate: config.effectiveBitRate,
     deviceHours: config.deviceRetentionHours,
     cloudHours: config.cloudRetentionHours,
   );
@@ -38,6 +41,26 @@ class AppViewModel {
   int get localBytes =>
       localSegments.fold(0, (total, segment) => total + segment.byteSize);
 
+  Duration get activeRecordingDuration {
+    if (!recorder.isRecording) {
+      return Duration.zero;
+    }
+    final duration = recorder.activeDuration(DateTime.now().toUtc());
+    if (duration == null || duration.isNegative) {
+      return Duration.zero;
+    }
+    return duration;
+  }
+
+  int get activeRecordingBytes {
+    if (activeRecordingDuration <= Duration.zero) {
+      return 0;
+    }
+    return estimate.bytesPerSecond * activeRecordingDuration.inSeconds;
+  }
+
+  int get localWindowBytes => localBytes + activeRecordingBytes;
+
   int get cloudBytes => segments
       .where((segment) => segment.isUploaded)
       .fold(0, (total, segment) => total + segment.byteSize);
@@ -46,6 +69,7 @@ class AppViewModel {
       .where(
         (segment) =>
             segment.uploadStatus == SegmentUploadStatus.pending ||
+            segment.uploadStatus == SegmentUploadStatus.uploading ||
             segment.uploadStatus == SegmentUploadStatus.failed,
       )
       .length;
@@ -60,14 +84,46 @@ class AppViewModel {
   Duration get indexedDuration {
     return segments.fold(
       Duration.zero,
-      (total, segment) => total + segment.duration,
+      (total, segment) => total + segment.canonicalDuration,
     );
   }
+
+  Duration get localWindowDuration => indexedDuration + activeRecordingDuration;
+
+  int get continuityGapCount {
+    final bySession = <String, List<RecordingSegment>>{};
+    for (final segment in segments.where(
+      (segment) => segment.hasSampleTimeline,
+    )) {
+      bySession.putIfAbsent(segment.captureSessionId, () => []).add(segment);
+    }
+    var gaps = 0;
+    for (final sessionSegments in bySession.values) {
+      sessionSegments.sort((a, b) => a.sequence.compareTo(b.sequence));
+      for (var index = 1; index < sessionSegments.length; index += 1) {
+        final previous = sessionSegments[index - 1];
+        final current = sessionSegments[index];
+        if (previous.endSampleExclusive != current.startSample) {
+          gaps += 1;
+        }
+      }
+    }
+    return gaps;
+  }
+
+  int get overlappedSegments =>
+      segments.where((segment) => segment.overlapSamples > 0).length;
 
   bool get canUploadToSelectedProvider {
     if (!config.uploadEnabled || !config.cloudProvider.isImplemented) {
       return false;
     }
-    return config.s3TargetReady && secrets.hasS3Credentials;
+    if (config.backendBaseUrl.trim().isNotEmpty &&
+        secrets.hasBackendDeviceToken) {
+      return true;
+    }
+    return config.cloudProvider == CloudProvider.s3 &&
+        config.s3TargetReady &&
+        secrets.hasS3Credentials;
   }
 }
