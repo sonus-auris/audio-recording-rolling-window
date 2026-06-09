@@ -5,6 +5,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'src/app/app_controller.dart';
 import 'src/app/app_view_model.dart';
+import 'src/models/app_config.dart';
 import 'src/models/cloud_provider.dart';
 import 'src/models/cloud_secrets.dart';
 import 'src/models/storage_estimate.dart';
@@ -257,6 +258,11 @@ class _SettingsPageState extends State<SettingsPage> {
           onPausePlayback: widget.controller.pausePlayback,
           onStopPlayback: widget.controller.stopPlayback,
           onSendAlert: widget.controller.sendManualAlert,
+          onSaveRangePermanently: (startedAtUtc, endedAtUtc) =>
+              widget.controller.saveRangePermanently(
+                startedAtUtc: startedAtUtc,
+                endedAtUtc: endedAtUtc,
+              ),
         );
       case 2:
         return Form(
@@ -270,6 +276,8 @@ class _SettingsPageState extends State<SettingsPage> {
             onProviderChanged: (provider) =>
                 setState(() => _selectedProvider = provider),
             onSave: () => _save(viewModel),
+            onAudioConfigChanged: (updated) =>
+                widget.controller.saveConfig(updated),
             deviceRetentionController: _deviceRetentionController,
             cloudRetentionController: _cloudRetentionController,
             segmentMinutesController: _segmentMinutesController,
@@ -293,6 +301,7 @@ class _SettingsPageState extends State<SettingsPage> {
           onStart: widget.controller.startRecording,
           onStop: widget.controller.stopRecording,
           onSendAlert: widget.controller.sendManualAlert,
+          onConfirm: widget.controller.confirmRecording,
         );
     }
   }
@@ -347,6 +356,8 @@ class _SettingsPageState extends State<SettingsPage> {
       s3SecretAccessKey: _s3SecretKeyController.text,
       s3SessionToken: _s3SessionTokenController.text,
       backendDeviceToken: _backendDeviceTokenController.text,
+      // Preserve the Supabase identity token, which has no form field.
+      supabaseAccessToken: viewModel.secrets.supabaseAccessToken,
     );
     await widget.controller.saveConfig(config);
     await widget.controller.saveSecrets(secrets);
@@ -364,12 +375,14 @@ class _HomeView extends StatelessWidget {
     required this.onStart,
     required this.onStop,
     required this.onSendAlert,
+    required this.onConfirm,
   });
 
   final AppViewModel viewModel;
   final VoidCallback onStart;
   final VoidCallback onStop;
   final VoidCallback onSendAlert;
+  final VoidCallback onConfirm;
 
   @override
   Widget build(BuildContext context) {
@@ -382,6 +395,12 @@ class _HomeView extends StatelessWidget {
           onStop: onStop,
           onSendAlert: onSendAlert,
         ),
+        const SizedBox(height: 12),
+        OutlinedButton.icon(
+          onPressed: onConfirm,
+          icon: const Icon(Icons.verified_outlined),
+          label: const Text("Confirm it's working"),
+        ),
         const SizedBox(height: 16),
         _DiagnosticsSection(entries: viewModel.diagnosticEntries),
       ],
@@ -389,13 +408,14 @@ class _HomeView extends StatelessWidget {
   }
 }
 
-class _PlaybackView extends StatelessWidget {
+class _PlaybackView extends StatefulWidget {
   const _PlaybackView({
     required this.viewModel,
     required this.onPlay,
     required this.onPausePlayback,
     required this.onStopPlayback,
     required this.onSendAlert,
+    required this.onSaveRangePermanently,
   });
 
   final AppViewModel viewModel;
@@ -403,11 +423,45 @@ class _PlaybackView extends StatelessWidget {
   final VoidCallback onPausePlayback;
   final VoidCallback onStopPlayback;
   final VoidCallback onSendAlert;
+  final Future<void> Function(DateTime startedAtUtc, DateTime endedAtUtc)
+  onSaveRangePermanently;
+
+  @override
+  State<_PlaybackView> createState() => _PlaybackViewState();
+}
+
+class _PlaybackViewState extends State<_PlaybackView> {
+  final _saveStartController = TextEditingController();
+  final _saveEndController = TextEditingController();
+
+  bool _rangeSeeded = false;
+  bool _isSavingRange = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncDefaultRange();
+  }
+
+  @override
+  void didUpdateWidget(covariant _PlaybackView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _syncDefaultRange();
+  }
+
+  @override
+  void dispose() {
+    _saveStartController.dispose();
+    _saveEndController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
+    final viewModel = widget.viewModel;
     final playback = viewModel.playback;
     final recent = viewModel.localSegments.reversed.take(12).toList();
+    final canSubmitRange = !_isSavingRange && viewModel.segments.isNotEmpty;
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
       children: [
@@ -421,23 +475,25 @@ class _PlaybackView extends StatelessWidget {
                 runSpacing: 8,
                 children: [
                   FilledButton.icon(
-                    onPressed: viewModel.localSegments.isEmpty ? null : onPlay,
+                    onPressed: viewModel.localSegments.isEmpty
+                        ? null
+                        : widget.onPlay,
                     icon: const Icon(Icons.play_arrow),
                     label: const Text('Play Local Window'),
                   ),
                   if (playback.isPlaying)
                     IconButton.outlined(
                       tooltip: 'Pause playback',
-                      onPressed: onPausePlayback,
+                      onPressed: widget.onPausePlayback,
                       icon: const Icon(Icons.pause),
                     ),
                   IconButton.outlined(
                     tooltip: 'Stop playback',
-                    onPressed: playback.isLoaded ? onStopPlayback : null,
+                    onPressed: playback.isLoaded ? widget.onStopPlayback : null,
                     icon: const Icon(Icons.stop_circle_outlined),
                   ),
                   OutlinedButton.icon(
-                    onPressed: onSendAlert,
+                    onPressed: widget.onSendAlert,
                     icon: const Icon(Icons.notification_important_outlined),
                     label: const Text('Send Alert'),
                   ),
@@ -463,6 +519,11 @@ class _PlaybackView extends StatelessWidget {
                     label: 'Overlapped',
                     value: viewModel.overlappedSegments.toString(),
                   ),
+                  _MetricChip(
+                    icon: Icons.lock_outline,
+                    label: 'Permanent',
+                    value: viewModel.permanentSegmentCount.toString(),
+                  ),
                 ],
               ),
               if (playback.error != null) ...[
@@ -472,6 +533,55 @@ class _PlaybackView extends StatelessWidget {
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        _Section(
+          title: 'Permanent Save',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  SizedBox(
+                    width: 240,
+                    child: TextField(
+                      controller: _saveStartController,
+                      decoration: const InputDecoration(
+                        labelText: 'Start timestamp',
+                        prefixIcon: Icon(Icons.first_page),
+                      ),
+                      keyboardType: TextInputType.datetime,
+                    ),
+                  ),
+                  SizedBox(
+                    width: 240,
+                    child: TextField(
+                      controller: _saveEndController,
+                      decoration: const InputDecoration(
+                        labelText: 'End timestamp',
+                        prefixIcon: Icon(Icons.last_page),
+                      ),
+                      keyboardType: TextInputType.datetime,
+                    ),
+                  ),
+                  FilledButton.icon(
+                    onPressed: canSubmitRange ? _saveRange : null,
+                    icon: _isSavingRange
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.lock_outline),
+                    label: Text(_isSavingRange ? 'Saving' : 'Save Permanently'),
+                  ),
+                ],
+              ),
             ],
           ),
         ),
@@ -495,12 +605,88 @@ class _PlaybackView extends StatelessWidget {
                         '${_formatDuration(segment.canonicalDuration)}'
                         ' / overlap ${_formatDuration(segment.trimStart)}',
                     trailing: StorageEstimate.formatBytes(segment.byteSize),
+                    statusIcon: segment.isPermanentlySaved
+                        ? Icons.lock_outline
+                        : null,
+                    statusTooltip: segment.isPermanentlySaved
+                        ? 'Permanently saved'
+                        : null,
                   ),
             ],
           ),
         ),
       ],
     );
+  }
+
+  Future<void> _saveRange() async {
+    final startedAtUtc = _parseTimestamp(_saveStartController.text);
+    final endedAtUtc = _parseTimestamp(_saveEndController.text);
+    if (startedAtUtc == null) {
+      _showSnack('Use a start timestamp.');
+      return;
+    }
+    if (endedAtUtc == null) {
+      _showSnack('Use an end timestamp.');
+      return;
+    }
+    if (!endedAtUtc.isAfter(startedAtUtc)) {
+      _showSnack('End timestamp must be after start timestamp.');
+      return;
+    }
+    setState(() => _isSavingRange = true);
+    try {
+      await widget.onSaveRangePermanently(startedAtUtc, endedAtUtc);
+    } finally {
+      if (mounted) {
+        setState(() => _isSavingRange = false);
+      }
+    }
+  }
+
+  DateTime? _parseTimestamp(String value) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      return null;
+    }
+    final parsed =
+        DateTime.tryParse(trimmed) ??
+        DateTime.tryParse(trimmed.replaceFirst(' ', 'T'));
+    return parsed?.toUtc();
+  }
+
+  void _syncDefaultRange() {
+    if (_rangeSeeded) {
+      return;
+    }
+    final segments = [...widget.viewModel.segments]
+      ..sort((a, b) => a.startedAtUtc.compareTo(b.startedAtUtc));
+    if (segments.isEmpty) {
+      return;
+    }
+    final end = segments.last.endedAtUtc.toLocal();
+    final earliest = segments.first.startedAtUtc.toLocal();
+    var start = end.subtract(const Duration(minutes: 10));
+    if (start.isBefore(earliest)) {
+      start = earliest;
+    }
+    _saveStartController.text = _formatTimestamp(start);
+    _saveEndController.text = _formatTimestamp(end);
+    _rangeSeeded = true;
+  }
+
+  String _formatTimestamp(DateTime value) {
+    return value
+        .toLocal()
+        .toIso8601String()
+        .substring(0, 19)
+        .replaceFirst('T', ' ');
+  }
+
+  void _showSnack(String message) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   String _formatDuration(Duration duration) {
@@ -519,6 +705,7 @@ class _ConfigureView extends StatelessWidget {
     required this.onUploadEnabledChanged,
     required this.onProviderChanged,
     required this.onSave,
+    required this.onAudioConfigChanged,
     required this.deviceRetentionController,
     required this.cloudRetentionController,
     required this.segmentMinutesController,
@@ -542,6 +729,7 @@ class _ConfigureView extends StatelessWidget {
   final ValueChanged<bool> onUploadEnabledChanged;
   final ValueChanged<CloudProvider> onProviderChanged;
   final VoidCallback onSave;
+  final ValueChanged<AppConfig> onAudioConfigChanged;
   final TextEditingController deviceRetentionController;
   final TextEditingController cloudRetentionController;
   final TextEditingController segmentMinutesController;
@@ -612,12 +800,232 @@ class _ConfigureView extends StatelessWidget {
           },
         ),
         const SizedBox(height: 16),
+        _AudioTuningSection(
+          config: viewModel.config,
+          onChanged: onAudioConfigChanged,
+        ),
+        const SizedBox(height: 16),
         FilledButton.icon(
           onPressed: onSave,
           icon: const Icon(Icons.save),
           label: const Text('Save Configuration'),
         ),
       ],
+    );
+  }
+}
+
+/// Musician + sensitivity controls: capture intent, input gain, a 3-band tone
+/// control, loudness-trigger sensitivity, and verbal confirmation cues. Changes
+/// persist immediately (sliders on release) via [onChanged].
+class _AudioTuningSection extends StatefulWidget {
+  const _AudioTuningSection({required this.config, required this.onChanged});
+
+  final AppConfig config;
+  final ValueChanged<AppConfig> onChanged;
+
+  @override
+  State<_AudioTuningSection> createState() => _AudioTuningSectionState();
+}
+
+class _AudioTuningSectionState extends State<_AudioTuningSection> {
+  static const _useCaseLabels = {
+    'security': 'Security / dashcam',
+    'music': 'Music / instrument',
+    'meeting': 'Meeting',
+    'voice_note': 'Voice note',
+    'ambient': 'Ambient',
+  };
+
+  String? _syncedDeviceId;
+  late String _useCase;
+  late double _micSensitivity;
+  late double _noiseTriggerSensitivity;
+  late double _bass;
+  late double _mid;
+  late double _treble;
+  late bool _autoGain;
+  late bool _noiseSuppress;
+  late bool _verbalCues;
+
+  void _seed(AppConfig config) {
+    _useCase = config.useCase;
+    _micSensitivity = config.micSensitivity;
+    _noiseTriggerSensitivity = config.noiseTriggerSensitivity;
+    _bass = config.bassGainDb;
+    _mid = config.midGainDb;
+    _treble = config.trebleGainDb;
+    _autoGain = config.autoGain;
+    _noiseSuppress = config.noiseSuppress;
+    _verbalCues = config.verbalCuesEnabled;
+    _syncedDeviceId = config.deviceId;
+  }
+
+  void _apply() {
+    widget.onChanged(
+      widget.config.copyWith(
+        useCase: _useCase,
+        micSensitivity: _micSensitivity,
+        noiseTriggerSensitivity: _noiseTriggerSensitivity,
+        bassGainDb: _bass,
+        midGainDb: _mid,
+        trebleGainDb: _treble,
+        autoGain: _autoGain,
+        noiseSuppress: _noiseSuppress,
+        verbalCuesEnabled: _verbalCues,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_syncedDeviceId != widget.config.deviceId) {
+      _seed(widget.config);
+    }
+    return _Section(
+      title: 'Audio Tuning',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          DropdownButtonFormField<String>(
+            initialValue: _useCase,
+            decoration: const InputDecoration(labelText: 'Capture mode'),
+            items: [
+              for (final useCase in AppConfig.supportedUseCases)
+                DropdownMenuItem(
+                  value: useCase,
+                  child: Text(_useCaseLabels[useCase] ?? useCase),
+                ),
+            ],
+            onChanged: (value) {
+              if (value == null) {
+                return;
+              }
+              setState(() {
+                _useCase = value;
+                // Music preserves dynamics: disable platform AGC + denoise.
+                if (value == 'music') {
+                  _autoGain = false;
+                  _noiseSuppress = false;
+                } else if (value == 'security') {
+                  _autoGain = true;
+                  _noiseSuppress = true;
+                }
+              });
+              _apply();
+            },
+          ),
+          _slider(
+            label: 'Mic sensitivity',
+            value: _micSensitivity,
+            min: 0.25,
+            max: 4.0,
+            divisions: 15,
+            display: '${_micSensitivity.toStringAsFixed(2)}x',
+            onChanged: (v) => setState(() => _micSensitivity = v),
+          ),
+          _slider(
+            label: 'Noise alert sensitivity',
+            value: _noiseTriggerSensitivity,
+            min: 0.0,
+            max: 1.0,
+            divisions: 20,
+            display: '${(_noiseTriggerSensitivity * 100).round()}%',
+            onChanged: (v) => setState(() => _noiseTriggerSensitivity = v),
+          ),
+          _slider(
+            label: 'Bass',
+            value: _bass,
+            min: -12,
+            max: 12,
+            divisions: 24,
+            display: '${_bass.toStringAsFixed(0)} dB',
+            onChanged: (v) => setState(() => _bass = v),
+          ),
+          _slider(
+            label: 'Mid',
+            value: _mid,
+            min: -12,
+            max: 12,
+            divisions: 24,
+            display: '${_mid.toStringAsFixed(0)} dB',
+            onChanged: (v) => setState(() => _mid = v),
+          ),
+          _slider(
+            label: 'Treble',
+            value: _treble,
+            min: -12,
+            max: 12,
+            divisions: 24,
+            display: '${_treble.toStringAsFixed(0)} dB',
+            onChanged: (v) => setState(() => _treble = v),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Auto gain control'),
+            subtitle: const Text('Off for music to keep dynamics'),
+            value: _autoGain,
+            onChanged: (value) {
+              setState(() => _autoGain = value);
+              _apply();
+            },
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Noise suppression'),
+            value: _noiseSuppress,
+            onChanged: (value) {
+              setState(() => _noiseSuppress = value);
+              _apply();
+            },
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Verbal cues'),
+            subtitle: const Text('Speak "recording" / "saved" confirmations'),
+            value: _verbalCues,
+            onChanged: (value) {
+              setState(() => _verbalCues = value);
+              _apply();
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _slider({
+    required String label,
+    required double value,
+    required double min,
+    required double max,
+    required int divisions,
+    required String display,
+    required ValueChanged<double> onChanged,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(label),
+              Text(display, style: Theme.of(context).textTheme.labelMedium),
+            ],
+          ),
+          Slider(
+            value: value.clamp(min, max),
+            min: min,
+            max: max,
+            divisions: divisions,
+            label: display,
+            onChanged: onChanged,
+            onChangeEnd: (_) => _apply(),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1102,11 +1510,15 @@ class _SegmentListItem extends StatelessWidget {
     required this.title,
     required this.subtitle,
     required this.trailing,
+    this.statusIcon,
+    this.statusTooltip,
   });
 
   final String title;
   final String subtitle;
   final String trailing;
+  final IconData? statusIcon;
+  final String? statusTooltip;
 
   @override
   Widget build(BuildContext context) {
@@ -1141,6 +1553,17 @@ class _SegmentListItem extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 12),
+          if (statusIcon != null) ...[
+            Tooltip(
+              message: statusTooltip ?? '',
+              child: Icon(
+                statusIcon,
+                size: 18,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
           Text(trailing, style: theme.textTheme.labelLarge),
         ],
       ),

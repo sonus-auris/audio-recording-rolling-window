@@ -29,4 +29,26 @@ void main() {
     expect(segment.fileExtension, 'wav');
     expect(segment.contentType, 'audio/wav');
   });
+
+  test('persists permanent save metadata', () {
+    final startedAt = DateTime.utc(2026, 1, 2, 3, 4, 5);
+    final savedAt = DateTime.utc(2026, 1, 2, 4);
+    final segment = RecordingSegment(
+      id: 'segment-1',
+      startedAtUtc: startedAt,
+      endedAtUtc: startedAt.add(const Duration(minutes: 1)),
+      byteSize: 4,
+      uploadStatus: SegmentUploadStatus.uploaded,
+      remoteKey: 'rolling/segment-1.wav',
+      permanentRemoteKey: 'permanent/segment-1.wav',
+      permanentSavedAtUtc: savedAt,
+    );
+
+    final decoded = RecordingSegment.fromJson(segment.toJson());
+
+    expect(decoded.isUploaded, isTrue);
+    expect(decoded.isPermanentlySaved, isTrue);
+    expect(decoded.permanentRemoteKey, 'permanent/segment-1.wav');
+    expect(decoded.permanentSavedAtUtc, savedAt);
+  });
 }

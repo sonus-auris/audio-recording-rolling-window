@@ -10,7 +10,7 @@ Flutter Android/iOS app for continuous rolling audio capture. It keeps one micro
 - Overlap: 2 seconds at the start of every segment after the first
 - Encoding: PCM16 `.wav`, mono, 16 kHz, about 256 kbps
 - Provider support: the Rust backend at `~/codes/ores/k8s-cluster/remote/deployments/dd-sound-recorder-rs` can issue presigned upload URLs and fan out cloud copy jobs for S3, Google Drive, Microsoft OneDrive, and client-managed iCloud. Direct AWS S3 / S3-compatible PUT and DELETE remains available as a fallback only when S3 is selected.
-- UI: Home, Playback, and Configure screens.
+- UI: Home, Playback, and Configure screens. Playback can permanently save a timestamp range into long-term cloud storage.
 
 ## Storage Math
 
@@ -38,6 +38,8 @@ Compressed AAC at 64 kbps would be about 14.4 GB for 500 hours, but stop/start e
 - Local files are stored inside the app support directory. The segment index is written atomically, and corrupt index files are quarantined instead of crashing startup. Old local files are deleted only after they are uploaded, so failed uploads do not silently discard audio.
 - Segments persisted as `uploading` are retried on the next upload drain, so a crash during upload does not strand them forever.
 - Backend uploads create a server upload session, presign each segment, PUT the WAV file to the signed URL, then mark the segment complete.
+- Permanent saves select indexed segments overlapping a playback timestamp range. Direct S3 saves write or copy segments under `<prefix>/<deviceId>/permanent/...`; backend providers use `POST /api/mobile/v1/permanent-saves` so the server can copy retained chunks into the provider's long-term location.
+- Paid access for permanent saves should be enforced by the backend or billing entitlement layer. Gate or disable the direct S3 fallback in production if client-only S3 credentials would bypass that entitlement.
 - Alert requests can ask the backend to email a listening link 20 seconds before a manual or commotion trigger. The app queues alerts until matching uploaded audio is available, and the backend rejects alerts that do not overlap uploaded retained segments. The backend exposes `POST /api/mobile/v1/alerts` and `/listen/:alert_id`.
 - The backend and signed upload URLs must use HTTPS except for localhost development. Signed upload responses are accepted only for `PUT`, and unsafe signed headers are rejected.
 - Direct AWS S3 uploads require HTTPS and lowercase DNS-safe bucket names using letters, numbers, and hyphens. Custom S3-compatible endpoints must also use HTTPS.
@@ -50,6 +52,7 @@ Compressed AAC at 64 kbps would be about 14.4 GB for 500 hours, but stop/start e
 Use a bucket/prefix scoped principal. The app needs:
 
 - `s3:PutObject` for uploads
+- `s3:GetObject` on the rolling prefix and `s3:PutObject` on the permanent prefix for permanent saves copied from the rolling S3 window
 - `s3:DeleteObject` for cloud retention deletion
 
 If a later cloud playback browser needs listing, add `s3:ListBucket` scoped to the app prefix.

@@ -33,6 +33,9 @@ class RecordingSegment {
     this.localPath,
     this.remoteKey,
     this.uploadedAtUtc,
+    this.permanentRemoteKey,
+    this.permanentSavedAtUtc,
+    this.permanentError,
     this.error,
   });
 
@@ -54,6 +57,9 @@ class RecordingSegment {
   final SegmentUploadStatus uploadStatus;
   final String? remoteKey;
   final DateTime? uploadedAtUtc;
+  final String? permanentRemoteKey;
+  final DateTime? permanentSavedAtUtc;
+  final String? permanentError;
   final String? error;
 
   Duration get duration => endedAtUtc.difference(startedAtUtc);
@@ -103,7 +109,13 @@ class RecordingSegment {
 
   bool get isLocal => localPath != null && localPath!.isNotEmpty;
 
-  bool get isUploaded => uploadStatus == SegmentUploadStatus.uploaded;
+  bool get isUploaded =>
+      uploadStatus == SegmentUploadStatus.uploaded &&
+      remoteKey != null &&
+      remoteKey!.trim().isNotEmpty;
+
+  bool get isPermanentlySaved =>
+      permanentRemoteKey != null && permanentRemoteKey!.trim().isNotEmpty;
 
   RecordingSegment copyWith({
     String? id,
@@ -124,6 +136,9 @@ class RecordingSegment {
     SegmentUploadStatus? uploadStatus,
     Object? remoteKey = _unset,
     Object? uploadedAtUtc = _unset,
+    Object? permanentRemoteKey = _unset,
+    Object? permanentSavedAtUtc = _unset,
+    Object? permanentError = _unset,
     Object? error = _unset,
   }) {
     return RecordingSegment(
@@ -151,6 +166,15 @@ class RecordingSegment {
       uploadedAtUtc: identical(uploadedAtUtc, _unset)
           ? this.uploadedAtUtc
           : uploadedAtUtc as DateTime?,
+      permanentRemoteKey: identical(permanentRemoteKey, _unset)
+          ? this.permanentRemoteKey
+          : permanentRemoteKey as String?,
+      permanentSavedAtUtc: identical(permanentSavedAtUtc, _unset)
+          ? this.permanentSavedAtUtc
+          : permanentSavedAtUtc as DateTime?,
+      permanentError: identical(permanentError, _unset)
+          ? this.permanentError
+          : permanentError as String?,
       error: identical(error, _unset) ? this.error : error as String?,
     );
   }
@@ -175,6 +199,9 @@ class RecordingSegment {
       'uploadStatus': uploadStatus.name,
       'remoteKey': remoteKey,
       'uploadedAtUtc': uploadedAtUtc?.toIso8601String(),
+      'permanentRemoteKey': permanentRemoteKey,
+      'permanentSavedAtUtc': permanentSavedAtUtc?.toIso8601String(),
+      'permanentError': permanentError,
       'error': error,
     };
   }
@@ -203,6 +230,11 @@ class RecordingSegment {
       uploadedAtUtc: json['uploadedAtUtc'] == null
           ? null
           : DateTime.parse(json['uploadedAtUtc'] as String).toUtc(),
+      permanentRemoteKey: json['permanentRemoteKey'] as String?,
+      permanentSavedAtUtc: json['permanentSavedAtUtc'] == null
+          ? null
+          : DateTime.parse(json['permanentSavedAtUtc'] as String).toUtc(),
+      permanentError: json['permanentError'] as String?,
       error: json['error'] as String?,
     );
   }

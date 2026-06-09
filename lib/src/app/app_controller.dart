@@ -13,6 +13,7 @@ import '../models/recording_segment.dart';
 import '../services/background_capture_service.dart';
 import '../services/diagnostic_log.dart';
 import '../services/playback_service.dart';
+import '../services/recording_feedback.dart';
 import '../services/s3_storage_client.dart';
 import '../services/segment_index.dart';
 import '../services/segment_recorder.dart';
@@ -30,6 +31,7 @@ class AppController {
     S3StorageClient? s3StorageClient,
     SoundRecorderBackendClient? backendClient,
     DiagnosticLog? diagnosticLog,
+    RecordingFeedback? feedback,
   }) {
     final effectiveSegmentIndex = segmentIndex ?? SegmentIndex();
     final effectiveDiagnostics = diagnosticLog ?? DiagnosticLog();
@@ -45,6 +47,7 @@ class AppController {
       s3StorageClient: s3StorageClient ?? S3StorageClient(),
       backendClient: backendClient ?? SoundRecorderBackendClient(),
       diagnostics: effectiveDiagnostics,
+      feedback: feedback ?? RecordingFeedback(),
     );
   }
 
@@ -57,6 +60,7 @@ class AppController {
     required this._s3StorageClient,
     required this._backendClient,
     required this._diagnostics,
+    required this._feedback,
   }) {
     _viewModels =
         Rx.combineLatest9<
@@ -115,6 +119,7 @@ class AppController {
   final S3StorageClient _s3StorageClient;
   final SoundRecorderBackendClient _backendClient;
   final DiagnosticLog _diagnostics;
+  final RecordingFeedback _feedback;
 
   final BehaviorSubject<AppConfig> _config = BehaviorSubject();
   final BehaviorSubject<CloudSecrets> _secrets = BehaviorSubject();
@@ -147,6 +152,7 @@ class AppController {
     _pendingAlertEvents
       ..clear()
       ..addAll(pendingAlerts);
+    _feedback.enabled = config.verbalCuesEnabled;
     _config.add(config);
     _secrets.add(secrets);
     _segments.add(recovered);
@@ -188,6 +194,9 @@ class AppController {
       deviceRetentionHours,
       2000,
     );
+    final useCase = AppConfig.supportedUseCases.contains(config.useCase)
+        ? config.useCase
+        : 'security';
     final normalized = config.copyWith(
       deviceRetentionHours: deviceRetentionHours,
       cloudRetentionHours: cloudRetentionHours,
@@ -201,11 +210,18 @@ class AppController {
       s3Region: config.s3Region.trim(),
       s3Prefix: config.s3Prefix.trim(),
       s3Endpoint: config.s3Endpoint.trim(),
+      useCase: useCase,
+      micSensitivity: config.micSensitivity.clamp(0.25, 4.0),
+      noiseTriggerSensitivity: config.noiseTriggerSensitivity.clamp(0.0, 1.0),
+      bassGainDb: config.bassGainDb.clamp(-12.0, 12.0),
+      midGainDb: config.midGainDb.clamp(-12.0, 12.0),
+      trebleGainDb: config.trebleGainDb.clamp(-12.0, 12.0),
     );
     if (_backendSessionKey != _sessionKey(normalized, _secrets.valueOrNull)) {
       _backendSession = null;
       _backendSessionKey = null;
     }
+    _feedback.enabled = normalized.verbalCuesEnabled;
     await _settingsStore.saveConfig(normalized);
     _config.add(normalized);
     _message.add('Settings saved.');
@@ -240,6 +256,7 @@ class AppController {
       _diagnostics.add('Starting PCM microphone stream.');
       await _recorder.start(_config.value);
       _diagnostics.add('PCM microphone stream started.');
+      unawaited(_feedback.say('Recording started'));
       _message.add(
         backgroundError == null
             ? 'Recording started.'
@@ -264,6 +281,7 @@ class AppController {
     } finally {
       await _backgroundCaptureService.stop();
     }
+    unawaited(_feedback.say('Recording stopped'));
     _message.add(
       recorderError == null
           ? 'Recording stopped.'
@@ -281,6 +299,76 @@ class AppController {
 
   Future<void> stopPlayback() => _playback.stop();
 
+  Future<void> saveRangePermanently({
+    required DateTime startedAtUtc,
+    required DateTime endedAtUtc,
+  }) async {
+    if (!_config.hasValue || !_secrets.hasValue) {
+      return;
+    }
+    final rangeStart = startedAtUtc.toUtc();
+    final rangeEnd = endedAtUtc.toUtc();
+    if (!rangeEnd.isAfter(rangeStart)) {
+      _message.add('End timestamp must be after start timestamp.');
+      return;
+    }
+    final config = _config.value;
+    final secrets = _secrets.value;
+    final useBackend = _backendClient.canUseBackend(config, secrets);
+    final useDirectS3 =
+        !useBackend &&
+        config.cloudProvider == CloudProvider.s3 &&
+        config.s3TargetReady &&
+        secrets.hasS3Credentials;
+    if (!useBackend && !useDirectS3) {
+      _message.add(
+        config.cloudProvider == CloudProvider.s3
+            ? 'S3 bucket, region, access key, and secret key are required before permanent save can run.'
+            : '${config.cloudProvider.label} permanent save requires the sound recorder backend URL and device token.',
+      );
+      return;
+    }
+    final matching =
+        (await _segmentIndex.loadSegments())
+            .where(
+              (segment) =>
+                  segment.endedAtUtc.isAfter(rangeStart) &&
+                  segment.startedAtUtc.isBefore(rangeEnd),
+            )
+            .toList()
+          ..sort((a, b) => a.startedAtUtc.compareTo(b.startedAtUtc));
+    if (matching.isEmpty) {
+      _message.add('No indexed segments overlap that range.');
+      return;
+    }
+    final unsaved = matching
+        .where((segment) => !segment.isPermanentlySaved)
+        .toList();
+    if (unsaved.isEmpty) {
+      _message.add('That range is already permanently saved.');
+      return;
+    }
+    _diagnostics.add(
+      'Permanent save requested for ${unsaved.length} segment(s).',
+    );
+    if (useBackend) {
+      await _saveRangeViaBackend(
+        config: config,
+        secrets: secrets,
+        rangeStart: rangeStart,
+        rangeEnd: rangeEnd,
+        segments: unsaved,
+      );
+    } else {
+      await _saveRangeViaS3(
+        config: config,
+        secrets: secrets,
+        segments: unsaved,
+      );
+    }
+    await _enforceRetention();
+  }
+
   Future<void> sendManualAlert() {
     return _sendAlertForEvent(
       AudioTriggerEvent(
@@ -291,6 +379,26 @@ class AppController {
       ),
       userVisible: true,
     );
+  }
+
+  /// In-app confirmation that capture is live: reports recording state and the
+  /// current input level, and speaks it when verbal cues are enabled.
+  Future<void> confirmRecording() async {
+    final snapshot = _recorder.snapshots.value;
+    final recording = _recorder.isRecording;
+    final levelDb = snapshot.peakDb;
+    if (recording) {
+      final levelText = levelDb <= -120
+          ? 'no input detected yet'
+          : 'input level ${levelDb.toStringAsFixed(0)} dB';
+      _message.add('Recording is active — $levelText.');
+      await _feedback.say(
+        levelDb > -50 ? 'Recording, sound detected' : 'Recording, but quiet',
+      );
+    } else {
+      _message.add('Not recording. Press Start to begin capture.');
+      await _feedback.say('Not recording');
+    }
   }
 
   void requestUploadDrain() {
@@ -312,6 +420,7 @@ class AppController {
     await _playback.dispose();
     _s3StorageClient.close();
     _backendClient.close();
+    await _feedback.dispose();
     await _diagnostics.dispose();
     await _config.close();
     await _secrets.close();
@@ -489,6 +598,132 @@ class AppController {
     return result;
   }
 
+  Future<void> _saveRangeViaS3({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required List<RecordingSegment> segments,
+  }) async {
+    var saved = 0;
+    var failed = 0;
+    for (final segment in segments) {
+      final localPath = segment.localPath;
+      final result = await _s3StorageClient.saveSegmentPermanently(
+        config: config,
+        secrets: secrets,
+        segment: segment,
+        file: localPath == null ? null : File(localPath),
+      );
+      if (result.isSuccess) {
+        saved += 1;
+        await _replaceSegment(
+          segment.copyWith(
+            permanentRemoteKey: result.remoteKey,
+            permanentSavedAtUtc: DateTime.now().toUtc(),
+            permanentError: null,
+          ),
+        );
+      } else {
+        failed += 1;
+        await _replaceSegment(segment.copyWith(permanentError: result.error));
+      }
+    }
+    _message.add(_permanentSaveSummary(saved: saved, failed: failed));
+  }
+
+  Future<void> _saveRangeViaBackend({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required DateTime rangeStart,
+    required DateTime rangeEnd,
+    required List<RecordingSegment> segments,
+  }) async {
+    final prepared = <RecordingSegment>[];
+    var failed = 0;
+    for (final segment in segments) {
+      var current = segment;
+      if (current.remoteKey == null || current.remoteKey!.trim().isEmpty) {
+        final localPath = current.localPath;
+        if (localPath == null || localPath.trim().isEmpty) {
+          failed += 1;
+          await _replaceSegment(
+            current.copyWith(
+              permanentError:
+                  'Segment is not available locally or in cloud storage.',
+            ),
+          );
+          continue;
+        }
+        final uploadResult = await _uploadViaBackend(
+          config: config,
+          secrets: secrets,
+          segment: current,
+          file: File(localPath),
+        );
+        if (!uploadResult.isSuccess) {
+          failed += 1;
+          await _replaceSegment(
+            current.copyWith(
+              uploadStatus: SegmentUploadStatus.failed,
+              error: uploadResult.error,
+              permanentError: uploadResult.error,
+            ),
+          );
+          continue;
+        }
+        current = current.copyWith(
+          uploadStatus: SegmentUploadStatus.uploaded,
+          remoteKey: uploadResult.remoteKey,
+          uploadedAtUtc: DateTime.now().toUtc(),
+          error: null,
+        );
+        await _replaceSegment(current);
+      }
+      prepared.add(current);
+    }
+    if (prepared.isEmpty) {
+      _message.add(_permanentSaveSummary(saved: 0, failed: failed));
+      return;
+    }
+    final result = await _backendClient.saveSegmentsPermanently(
+      config: config,
+      secrets: secrets,
+      rangeStartedAtUtc: rangeStart,
+      rangeEndedAtUtc: rangeEnd,
+      segments: prepared,
+    );
+    if (!result.isSuccess) {
+      for (final segment in prepared) {
+        await _replaceSegment(segment.copyWith(permanentError: result.error));
+      }
+      _message.add(
+        _permanentSaveSummary(saved: 0, failed: failed + prepared.length),
+      );
+      return;
+    }
+    var saved = 0;
+    for (final segment in prepared) {
+      final permanentKey = result.remoteKeysBySegmentId[segment.id];
+      if (permanentKey == null || permanentKey.trim().isEmpty) {
+        failed += 1;
+        await _replaceSegment(
+          segment.copyWith(
+            permanentError: 'Permanent save did not return a storage key.',
+          ),
+        );
+        continue;
+      }
+      saved += 1;
+      await _replaceSegment(
+        segment.copyWith(
+          permanentRemoteKey: permanentKey,
+          permanentSavedAtUtc: DateTime.now().toUtc(),
+          permanentError: null,
+        ),
+      );
+    }
+    _message.add(_permanentSaveSummary(saved: saved, failed: failed));
+  }
+
   Future<void> _sendAlertForEvent(
     AudioTriggerEvent event, {
     bool userVisible = false,
@@ -599,6 +834,19 @@ class AppController {
     return '${config.backendBaseUrl.trim()}|${secrets.backendDeviceToken.trim()}';
   }
 
+  String _permanentSaveSummary({required int saved, required int failed}) {
+    if (saved > 0) {
+      unawaited(_feedback.say('Saved'));
+    }
+    if (saved > 0 && failed == 0) {
+      return 'Permanently saved $saved segment${saved == 1 ? '' : 's'}.';
+    }
+    if (saved > 0) {
+      return 'Permanently saved $saved segment${saved == 1 ? '' : 's'}; $failed failed.';
+    }
+    return 'Permanent save failed for $failed segment${failed == 1 ? '' : 's'}.';
+  }
+
   Future<void> _enforceRetention() async {
     if (!_config.hasValue || !_secrets.hasValue) {
       return;
@@ -630,9 +878,7 @@ class AppController {
               segment.copyWith(
                 remoteKey: null,
                 uploadedAtUtc: null,
-                uploadStatus: segment.isLocal
-                    ? SegmentUploadStatus.localOnly
-                    : SegmentUploadStatus.uploaded,
+                uploadStatus: SegmentUploadStatus.localOnly,
               ),
             );
           } else {

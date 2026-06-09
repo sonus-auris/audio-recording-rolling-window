@@ -52,6 +52,7 @@ class SegmentRecorder {
   DateTime? _lastCommotionAlertUtc;
   bool _running = false;
   bool _stopping = false;
+  _AudioDsp? _dsp;
 
   ValueStream<RecorderSnapshot> get snapshots => _snapshot.stream;
 
@@ -87,9 +88,10 @@ class SegmentRecorder {
           encoder: AudioEncoder.pcm16bits,
           sampleRate: config.sampleRate,
           numChannels: config.channels,
-          autoGain: true,
+          // Music capture keeps dynamics: platform AGC/denoise default off.
+          autoGain: config.autoGain,
           echoCancel: false,
-          noiseSuppress: true,
+          noiseSuppress: config.noiseSuppress,
           audioInterruption: AudioInterruptionMode.pauseResume,
           streamBufferSize: _streamBufferSize(config),
         ),
@@ -210,6 +212,7 @@ class SegmentRecorder {
     _sequence = 0;
     _commotionSamples = 0;
     _lastCommotionAlertUtc = null;
+    _dsp = _AudioDsp.fromConfig(config);
   }
 
   int _streamBufferSize(AppConfig config) {
@@ -243,7 +246,10 @@ class SegmentRecorder {
         return;
       }
       final end = offset + takeSamples * frameSize;
-      final slice = Uint8List.sublistView(data, offset, end);
+      final rawSlice = Uint8List.sublistView(data, offset, end);
+      // Apply client-side gain + tone shaping so stored audio, overlap, and the
+      // loudness trigger all see the same processed signal.
+      final slice = _dsp?.process(rawSlice, config.channels) ?? rawSlice;
       await writer.write(slice);
       _currentUniqueSamples += takeSamples;
       _totalLiveSamples += takeSamples;
@@ -405,13 +411,20 @@ class SegmentRecorder {
       return;
     }
     final stats = _pcmPower(bytes);
-    final loud = stats.averagePower >= 0.12 || stats.peakPower >= 0.72;
+    // Higher sensitivity (0..1) lowers the loudness thresholds and the time the
+    // sound must be sustained before the "commotion" alert fires.
+    final sensitivity = config.noiseTriggerSensitivity.clamp(0.0, 1.0);
+    final avgThreshold = 0.30 - 0.26 * sensitivity;
+    final peakThreshold = 0.95 - 0.55 * sensitivity;
+    final loud =
+        stats.averagePower >= avgThreshold || stats.peakPower >= peakThreshold;
     if (loud) {
       _commotionSamples += samples;
     } else {
       _commotionSamples = math.max(0, _commotionSamples - samples);
     }
-    final sustainedSamples = config.sampleRate * 3;
+    final sustainSeconds = (5.0 - 4.0 * sensitivity).clamp(1.0, 5.0);
+    final sustainedSamples = (config.sampleRate * sustainSeconds).round();
     if (_commotionSamples < sustainedSamples) {
       return;
     }
@@ -480,4 +493,134 @@ class _PcmPower {
 
   final double averagePower;
   final double peakPower;
+}
+
+/// Client-side audio shaping for int16 PCM: a linear input gain followed by an
+/// optional 3-band tone control (low shelf / mid peak / high shelf). Filter
+/// state is kept per channel across slices so segment boundaries stay seamless.
+class _AudioDsp {
+  _AudioDsp._(this._gain, this._stages, int channels)
+    : _states = List.generate(
+        _stages.length,
+        (_) => List.generate(channels, (_) => _BiquadState()),
+      );
+
+  final double _gain;
+  final List<_Biquad> _stages;
+  final List<List<_BiquadState>> _states;
+
+  static _AudioDsp? fromConfig(AppConfig config) {
+    if (!config.hasAudioDsp) {
+      return null;
+    }
+    final fs = config.sampleRate.toDouble();
+    final stages = <_Biquad>[];
+    if (config.bassGainDb != 0.0) {
+      stages.add(_Biquad.lowShelf(fs, 120, config.bassGainDb));
+    }
+    if (config.midGainDb != 0.0) {
+      stages.add(_Biquad.peaking(fs, 1000, 0.9, config.midGainDb));
+    }
+    if (config.trebleGainDb != 0.0) {
+      stages.add(_Biquad.highShelf(fs, 6000, config.trebleGainDb));
+    }
+    return _AudioDsp._(config.micSensitivity, stages, config.channels.clamp(1, 2));
+  }
+
+  Uint8List process(Uint8List frameBytes, int channels) {
+    final out = Uint8List.fromList(frameBytes);
+    final view = ByteData.sublistView(out);
+    final sampleCount = out.length ~/ 2;
+    for (var i = 0; i < sampleCount; i++) {
+      final channel = channels <= 1 ? 0 : i % channels;
+      var sample = view.getInt16(i * 2, Endian.little) / 32768.0;
+      sample *= _gain;
+      for (var s = 0; s < _stages.length; s++) {
+        sample = _states[s][channel].process(_stages[s], sample);
+      }
+      var scaled = (sample * 32768.0).round();
+      if (scaled > 32767) {
+        scaled = 32767;
+      } else if (scaled < -32768) {
+        scaled = -32768;
+      }
+      view.setInt16(i * 2, scaled, Endian.little);
+    }
+    return out;
+  }
+}
+
+/// Normalized (a0 == 1) biquad coefficients from the RBJ audio EQ cookbook.
+class _Biquad {
+  const _Biquad(this.b0, this.b1, this.b2, this.a1, this.a2);
+
+  final double b0;
+  final double b1;
+  final double b2;
+  final double a1;
+  final double a2;
+
+  factory _Biquad.peaking(double fs, double f0, double q, double gainDb) {
+    final a = math.pow(10, gainDb / 40).toDouble();
+    final w0 = 2 * math.pi * f0 / fs;
+    final cosW0 = math.cos(w0);
+    final alpha = math.sin(w0) / (2 * q);
+    final a0 = 1 + alpha / a;
+    return _Biquad(
+      (1 + alpha * a) / a0,
+      (-2 * cosW0) / a0,
+      (1 - alpha * a) / a0,
+      (-2 * cosW0) / a0,
+      (1 - alpha / a) / a0,
+    );
+  }
+
+  factory _Biquad.lowShelf(double fs, double f0, double gainDb) {
+    final a = math.pow(10, gainDb / 40).toDouble();
+    final w0 = 2 * math.pi * f0 / fs;
+    final cosW0 = math.cos(w0);
+    final alpha = math.sin(w0) / 2 * math.sqrt2;
+    final twoSqrtAAlpha = 2 * math.sqrt(a) * alpha;
+    final a0 = (a + 1) + (a - 1) * cosW0 + twoSqrtAAlpha;
+    return _Biquad(
+      (a * ((a + 1) - (a - 1) * cosW0 + twoSqrtAAlpha)) / a0,
+      (2 * a * ((a - 1) - (a + 1) * cosW0)) / a0,
+      (a * ((a + 1) - (a - 1) * cosW0 - twoSqrtAAlpha)) / a0,
+      (-2 * ((a - 1) + (a + 1) * cosW0)) / a0,
+      ((a + 1) + (a - 1) * cosW0 - twoSqrtAAlpha) / a0,
+    );
+  }
+
+  factory _Biquad.highShelf(double fs, double f0, double gainDb) {
+    final a = math.pow(10, gainDb / 40).toDouble();
+    final w0 = 2 * math.pi * f0 / fs;
+    final cosW0 = math.cos(w0);
+    final alpha = math.sin(w0) / 2 * math.sqrt2;
+    final twoSqrtAAlpha = 2 * math.sqrt(a) * alpha;
+    final a0 = (a + 1) - (a - 1) * cosW0 + twoSqrtAAlpha;
+    return _Biquad(
+      (a * ((a + 1) + (a - 1) * cosW0 + twoSqrtAAlpha)) / a0,
+      (-2 * a * ((a - 1) + (a + 1) * cosW0)) / a0,
+      (a * ((a + 1) + (a - 1) * cosW0 - twoSqrtAAlpha)) / a0,
+      (2 * ((a - 1) - (a + 1) * cosW0)) / a0,
+      ((a + 1) - (a - 1) * cosW0 - twoSqrtAAlpha) / a0,
+    );
+  }
+}
+
+class _BiquadState {
+  double _x1 = 0;
+  double _x2 = 0;
+  double _y1 = 0;
+  double _y2 = 0;
+
+  double process(_Biquad c, double x) {
+    final y =
+        c.b0 * x + c.b1 * _x1 + c.b2 * _x2 - c.a1 * _y1 - c.a2 * _y2;
+    _x2 = _x1;
+    _x1 = x;
+    _y2 = _y1;
+    _y1 = y;
+    return y;
+  }
 }

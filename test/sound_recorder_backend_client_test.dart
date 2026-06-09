@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:audio_dashcam/src/models/app_config.dart';
+import 'package:audio_dashcam/src/models/cloud_provider.dart';
 import 'package:audio_dashcam/src/models/cloud_secrets.dart';
 import 'package:audio_dashcam/src/models/recording_segment.dart';
 import 'package:audio_dashcam/src/services/sound_recorder_backend_client.dart';
@@ -147,6 +148,68 @@ void main() {
     );
 
     expect(error, contains('HTTPS'));
+    client.close();
+  });
+
+  test('posts permanent save requests and maps storage keys', () async {
+    final client = SoundRecorderBackendClient(
+      httpClient: MockClient((request) async {
+        expect(request.method, 'POST');
+        expect(request.url.path, '/api/mobile/v1/permanent-saves');
+        expect(request.headers['authorization'], 'Bearer device-token');
+        final body = jsonDecode(request.body) as Map<String, dynamic>;
+        expect(
+          body['provider'],
+          SoundRecorderBackendClient.canonicalProviderName(
+            CloudProvider.googleDrive,
+          ),
+        );
+        expect(body['provider'], 'google_drive');
+        expect(body['rangeStartedAt'], '2026-01-02T03:04:05.000Z');
+        final segments = body['segments'] as List<dynamic>;
+        expect(segments, hasLength(1));
+        expect(
+          (segments.single as Map<String, dynamic>)['storageKey'],
+          'audio-dashcam/device-a/segment.wav',
+        );
+        return http.Response(
+          jsonEncode({
+            'segments': [
+              {
+                'id': 'segment-1',
+                'permanentStorageKey':
+                    'permanent/google-drive/device-a/segment.wav',
+              },
+            ],
+          }),
+          200,
+          headers: const {'content-type': 'application/json'},
+        );
+      }),
+    );
+
+    final result = await client.saveSegmentsPermanently(
+      config: const AppConfig(
+        deviceId: 'device-a',
+        cloudProvider: CloudProvider.googleDrive,
+        backendBaseUrl: 'https://backend.example',
+      ),
+      secrets: secrets,
+      rangeStartedAtUtc: DateTime.utc(2026, 1, 2, 3, 4, 5),
+      rangeEndedAtUtc: DateTime.utc(2026, 1, 2, 3, 5, 5),
+      segments: [
+        segment.copyWith(
+          uploadStatus: SegmentUploadStatus.uploaded,
+          remoteKey: 'audio-dashcam/device-a/segment.wav',
+        ),
+      ],
+    );
+
+    expect(result.isSuccess, isTrue);
+    expect(
+      result.remoteKeysBySegmentId['segment-1'],
+      'permanent/google-drive/device-a/segment.wav',
+    );
     client.close();
   });
 }

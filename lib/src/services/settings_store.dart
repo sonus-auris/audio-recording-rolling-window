@@ -27,6 +27,7 @@ class SettingsStore {
   static const _s3SecretKeyKey = 'audio_dashcam.s3.secret_access_key';
   static const _s3SessionTokenKey = 'audio_dashcam.s3.session_token';
   static const _backendDeviceTokenKey = 'audio_dashcam.backend.device_token';
+  static const _supabaseAccessTokenKey = 'audio_dashcam.supabase.access_token';
 
   final FlutterSecureStorage _secureStorage;
   final Uuid _uuid;
@@ -90,6 +91,8 @@ class SettingsStore {
       s3SessionToken: await _secureStorage.read(key: _s3SessionTokenKey) ?? '',
       backendDeviceToken:
           await _secureStorage.read(key: _backendDeviceTokenKey) ?? '',
+      supabaseAccessToken:
+          await _secureStorage.read(key: _supabaseAccessTokenKey) ?? '',
     );
   }
 
@@ -98,6 +101,7 @@ class SettingsStore {
     await _writeSecure(_s3SecretKeyKey, secrets.s3SecretAccessKey);
     await _writeSecure(_s3SessionTokenKey, secrets.s3SessionToken);
     await _writeSecure(_backendDeviceTokenKey, secrets.backendDeviceToken);
+    await _writeSecure(_supabaseAccessTokenKey, secrets.supabaseAccessToken);
   }
 
   Future<void> _writeSecure(String key, String value) async {

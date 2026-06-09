@@ -65,6 +65,13 @@ class AppViewModel {
       .where((segment) => segment.isUploaded)
       .fold(0, (total, segment) => total + segment.byteSize);
 
+  int get permanentSegmentCount =>
+      segments.where((segment) => segment.isPermanentlySaved).length;
+
+  int get permanentBytes => segments
+      .where((segment) => segment.isPermanentlySaved)
+      .fold(0, (total, segment) => total + segment.byteSize);
+
   int get pendingUploads => segments
       .where(
         (segment) =>
@@ -116,6 +123,19 @@ class AppViewModel {
 
   bool get canUploadToSelectedProvider {
     if (!config.uploadEnabled || !config.cloudProvider.isImplemented) {
+      return false;
+    }
+    if (config.backendBaseUrl.trim().isNotEmpty &&
+        secrets.hasBackendDeviceToken) {
+      return true;
+    }
+    return config.cloudProvider == CloudProvider.s3 &&
+        config.s3TargetReady &&
+        secrets.hasS3Credentials;
+  }
+
+  bool get canSavePermanently {
+    if (!config.cloudProvider.isImplemented) {
       return false;
     }
     if (config.backendBaseUrl.trim().isNotEmpty &&

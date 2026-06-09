@@ -17,7 +17,26 @@ class AppConfig {
     this.s3Region = 'us-east-1',
     this.s3Prefix = 'audio-dashcam',
     this.s3Endpoint = '',
+    this.useCase = 'security',
+    this.micSensitivity = 1.0,
+    this.noiseTriggerSensitivity = 0.5,
+    this.bassGainDb = 0.0,
+    this.midGainDb = 0.0,
+    this.trebleGainDb = 0.0,
+    this.autoGain = true,
+    this.noiseSuppress = true,
+    this.verbalCuesEnabled = false,
   });
+
+  /// Capture intents understood by both the app and the backend. Music turns off
+  /// the speech-oriented DSP so dynamics and frequency content are preserved.
+  static const List<String> supportedUseCases = [
+    'security',
+    'music',
+    'meeting',
+    'voice_note',
+    'ambient',
+  ];
 
   final String deviceId;
   final int deviceRetentionHours;
@@ -34,6 +53,51 @@ class AppConfig {
   final String s3Region;
   final String s3Prefix;
   final String s3Endpoint;
+
+  /// One of [supportedUseCases].
+  final String useCase;
+
+  /// Linear input gain applied to captured PCM (0.25x..4x). 1.0 is unity.
+  final double micSensitivity;
+
+  /// Loudness-trigger sensitivity in 0..1; higher fires the "commotion" alert on
+  /// quieter sound. Maps to RMS/peak thresholds in the recorder.
+  final double noiseTriggerSensitivity;
+
+  /// Tone controls in dB (-12..+12) applied as low/mid/high shelving+peak gain.
+  final double bassGainDb;
+  final double midGainDb;
+  final double trebleGainDb;
+
+  /// Platform auto-gain control. Off by default for music to keep dynamics.
+  final bool autoGain;
+
+  /// Platform noise suppression. Off by default for music.
+  final bool noiseSuppress;
+
+  /// Speak short confirmations ("recording", "saved") while capturing.
+  final bool verbalCuesEnabled;
+
+  bool get isMusic => useCase == 'music';
+
+  bool get hasToneAdjustment =>
+      bassGainDb != 0.0 || midGainDb != 0.0 || trebleGainDb != 0.0;
+
+  /// Whether any client-side DSP must run on the PCM stream.
+  bool get hasAudioDsp => micSensitivity != 1.0 || hasToneAdjustment;
+
+  /// Snapshot of the audio tuning, mirrored to the backend session so playback
+  /// and audit can reproduce the capture configuration.
+  Map<String, Object?> get audioProfile => {
+    'useCase': useCase,
+    'micSensitivity': micSensitivity,
+    'noiseTriggerSensitivity': noiseTriggerSensitivity,
+    'bassGainDb': bassGainDb,
+    'midGainDb': midGainDb,
+    'trebleGainDb': trebleGainDb,
+    'autoGain': autoGain,
+    'noiseSuppress': noiseSuppress,
+  };
 
   bool get s3TargetReady =>
       s3Bucket.trim().isNotEmpty && s3Region.trim().isNotEmpty;
@@ -70,6 +134,15 @@ class AppConfig {
     String? s3Region,
     String? s3Prefix,
     String? s3Endpoint,
+    String? useCase,
+    double? micSensitivity,
+    double? noiseTriggerSensitivity,
+    double? bassGainDb,
+    double? midGainDb,
+    double? trebleGainDb,
+    bool? autoGain,
+    bool? noiseSuppress,
+    bool? verbalCuesEnabled,
   }) {
     return AppConfig(
       deviceId: deviceId ?? this.deviceId,
@@ -87,6 +160,16 @@ class AppConfig {
       s3Region: s3Region ?? this.s3Region,
       s3Prefix: s3Prefix ?? this.s3Prefix,
       s3Endpoint: s3Endpoint ?? this.s3Endpoint,
+      useCase: useCase ?? this.useCase,
+      micSensitivity: micSensitivity ?? this.micSensitivity,
+      noiseTriggerSensitivity:
+          noiseTriggerSensitivity ?? this.noiseTriggerSensitivity,
+      bassGainDb: bassGainDb ?? this.bassGainDb,
+      midGainDb: midGainDb ?? this.midGainDb,
+      trebleGainDb: trebleGainDb ?? this.trebleGainDb,
+      autoGain: autoGain ?? this.autoGain,
+      noiseSuppress: noiseSuppress ?? this.noiseSuppress,
+      verbalCuesEnabled: verbalCuesEnabled ?? this.verbalCuesEnabled,
     );
   }
 
@@ -107,10 +190,20 @@ class AppConfig {
       's3Region': s3Region,
       's3Prefix': s3Prefix,
       's3Endpoint': s3Endpoint,
+      'useCase': useCase,
+      'micSensitivity': micSensitivity,
+      'noiseTriggerSensitivity': noiseTriggerSensitivity,
+      'bassGainDb': bassGainDb,
+      'midGainDb': midGainDb,
+      'trebleGainDb': trebleGainDb,
+      'autoGain': autoGain,
+      'noiseSuppress': noiseSuppress,
+      'verbalCuesEnabled': verbalCuesEnabled,
     };
   }
 
   factory AppConfig.fromJson(Map<String, dynamic> json) {
+    final useCase = json['useCase'] as String? ?? 'security';
     return AppConfig(
       deviceId: json['deviceId'] as String,
       deviceRetentionHours: _asInt(json['deviceRetentionHours'], 50),
@@ -127,6 +220,18 @@ class AppConfig {
       s3Region: json['s3Region'] as String? ?? 'us-east-1',
       s3Prefix: json['s3Prefix'] as String? ?? 'audio-dashcam',
       s3Endpoint: json['s3Endpoint'] as String? ?? '',
+      useCase: supportedUseCases.contains(useCase) ? useCase : 'security',
+      micSensitivity: _asDouble(json['micSensitivity'], 1.0).clamp(0.25, 4.0),
+      noiseTriggerSensitivity: _asDouble(
+        json['noiseTriggerSensitivity'],
+        0.5,
+      ).clamp(0.0, 1.0),
+      bassGainDb: _asDouble(json['bassGainDb'], 0.0).clamp(-12.0, 12.0),
+      midGainDb: _asDouble(json['midGainDb'], 0.0).clamp(-12.0, 12.0),
+      trebleGainDb: _asDouble(json['trebleGainDb'], 0.0).clamp(-12.0, 12.0),
+      autoGain: json['autoGain'] as bool? ?? true,
+      noiseSuppress: json['noiseSuppress'] as bool? ?? true,
+      verbalCuesEnabled: json['verbalCuesEnabled'] as bool? ?? false,
     );
   }
 
@@ -138,5 +243,15 @@ class AppConfig {
       return value.round();
     }
     return int.tryParse(value?.toString() ?? '') ?? fallback;
+  }
+
+  static double _asDouble(Object? value, double fallback) {
+    if (value is double) {
+      return value;
+    }
+    if (value is num) {
+      return value.toDouble();
+    }
+    return double.tryParse(value?.toString() ?? '') ?? fallback;
   }
 }

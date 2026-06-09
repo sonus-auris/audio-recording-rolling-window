@@ -148,8 +148,7 @@ class SegmentIndex {
         updated.add(segment);
         continue;
       }
-      final canDeleteLocal =
-          segment.uploadStatus == SegmentUploadStatus.uploaded;
+      final canDeleteLocal = segment.isUploaded || segment.isPermanentlySaved;
       if (!canDeleteLocal) {
         updated.add(segment);
         continue;
@@ -170,7 +169,10 @@ class SegmentIndex {
   }) async {
     final retained = segments
         .where(
-          (segment) => segment.endedAtUtc.isAfter(cutoffUtc) || segment.isLocal,
+          (segment) =>
+              segment.endedAtUtc.isAfter(cutoffUtc) ||
+              segment.isLocal ||
+              segment.isPermanentlySaved,
         )
         .toList();
     await saveSegments(retained);

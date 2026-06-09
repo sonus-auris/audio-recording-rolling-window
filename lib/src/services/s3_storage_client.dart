@@ -44,38 +44,48 @@ class S3StorageClient {
     if (!await file.exists()) {
       return const UploadResult.failure('Local segment file is missing.');
     }
-    try {
-      final key = objectKeyFor(config, segment);
-      final bytes = await file.readAsBytes();
-      final uri = _objectUri(config, key);
-      final payloadHash = sha256.convert(bytes).toString();
-      final headers = _signedHeaders(
-        method: 'PUT',
-        uri: uri,
+    return _putFile(
+      config: config,
+      secrets: secrets,
+      key: objectKeyFor(config, segment),
+      file: file,
+      contentType: segment.contentType,
+    );
+  }
+
+  Future<UploadResult> saveSegmentPermanently({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required RecordingSegment segment,
+    File? file,
+  }) async {
+    if (!config.s3TargetReady || !secrets.hasS3Credentials) {
+      return const UploadResult.failure(
+        'S3 bucket, region, and credentials are required.',
+      );
+    }
+    final permanentKey = permanentObjectKeyFor(config, segment);
+    if (file != null && await file.exists()) {
+      return _putFile(
         config: config,
         secrets: secrets,
-        payloadHash: payloadHash,
-        extraHeaders: {'content-type': segment.contentType},
+        key: permanentKey,
+        file: file,
+        contentType: segment.contentType,
       );
-      final response = await _httpClient
-          .put(uri, headers: headers, body: bytes)
-          .timeout(requestTimeout);
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        return UploadResult.success(key);
-      }
-      return UploadResult.failure(
-        'S3 upload failed: HTTP ${response.statusCode} ${response.reasonPhrase ?? ''}'
-            .trim(),
-      );
-    } on TimeoutException {
-      return UploadResult.failure(
-        'S3 upload timed out after ${requestTimeout.inSeconds} seconds.',
-      );
-    } on FormatException catch (error) {
-      return UploadResult.failure(error.message);
-    } catch (error) {
-      return UploadResult.failure('S3 upload failed: $error');
     }
+    final sourceKey = segment.remoteKey;
+    if (sourceKey == null || sourceKey.trim().isEmpty) {
+      return const UploadResult.failure(
+        'Segment is not available locally or in S3.',
+      );
+    }
+    return _copyObject(
+      config: config,
+      secrets: secrets,
+      sourceKey: sourceKey,
+      destinationKey: permanentKey,
+    );
   }
 
   Future<String?> deleteObject({
@@ -132,6 +142,109 @@ class S3StorageClient {
       '${segment.id}.${segment.fileExtension}',
     ];
     return parts.join('/');
+  }
+
+  String permanentObjectKeyFor(AppConfig config, RecordingSegment segment) {
+    final prefix = config.s3Prefix
+        .split('/')
+        .map((part) => part.trim())
+        .where((part) => part.isNotEmpty)
+        .join('/');
+    final started = segment.startedAtUtc.toUtc();
+    final parts = <String>[
+      if (prefix.isNotEmpty) prefix,
+      config.deviceId,
+      'permanent',
+      started.year.toString().padLeft(4, '0'),
+      started.month.toString().padLeft(2, '0'),
+      started.day.toString().padLeft(2, '0'),
+      started.hour.toString().padLeft(2, '0'),
+      '${segment.id}.${segment.fileExtension}',
+    ];
+    return parts.join('/');
+  }
+
+  Future<UploadResult> _putFile({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required String key,
+    required File file,
+    required String contentType,
+  }) async {
+    try {
+      final bytes = await file.readAsBytes();
+      final uri = _objectUri(config, key);
+      final payloadHash = sha256.convert(bytes).toString();
+      final headers = _signedHeaders(
+        method: 'PUT',
+        uri: uri,
+        config: config,
+        secrets: secrets,
+        payloadHash: payloadHash,
+        extraHeaders: {'content-type': contentType},
+      );
+      final response = await _httpClient
+          .put(uri, headers: headers, body: bytes)
+          .timeout(requestTimeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return UploadResult.success(key);
+      }
+      return UploadResult.failure(
+        'S3 upload failed: HTTP ${response.statusCode} ${response.reasonPhrase ?? ''}'
+            .trim(),
+      );
+    } on TimeoutException {
+      return UploadResult.failure(
+        'S3 upload timed out after ${requestTimeout.inSeconds} seconds.',
+      );
+    } on FormatException catch (error) {
+      return UploadResult.failure(error.message);
+    } catch (error) {
+      return UploadResult.failure('S3 upload failed: $error');
+    }
+  }
+
+  Future<UploadResult> _copyObject({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required String sourceKey,
+    required String destinationKey,
+  }) async {
+    try {
+      final uri = _objectUri(config, destinationKey);
+      final payloadHash = sha256.convert(const <int>[]).toString();
+      final headers = _signedHeaders(
+        method: 'PUT',
+        uri: uri,
+        config: config,
+        secrets: secrets,
+        payloadHash: payloadHash,
+        extraHeaders: {'x-amz-copy-source': _copySource(config, sourceKey)},
+      );
+      final response = await _httpClient
+          .put(uri, headers: headers)
+          .timeout(requestTimeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return UploadResult.success(destinationKey);
+      }
+      return UploadResult.failure(
+        'S3 copy failed: HTTP ${response.statusCode} ${response.reasonPhrase ?? ''}'
+            .trim(),
+      );
+    } on TimeoutException {
+      return UploadResult.failure(
+        'S3 copy timed out after ${requestTimeout.inSeconds} seconds.',
+      );
+    } on FormatException catch (error) {
+      return UploadResult.failure(error.message);
+    } catch (error) {
+      return UploadResult.failure('S3 copy failed: $error');
+    }
+  }
+
+  String _copySource(AppConfig config, String key) {
+    final encodedKey = key.split('/').map(_awsEncode).join('/');
+    return '${Uri.encodeComponent(config.s3Bucket.trim())}/$encodedKey';
   }
 
   Uri _objectUri(AppConfig config, String key) {

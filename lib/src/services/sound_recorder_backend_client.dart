@@ -6,6 +6,7 @@ import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 
 import '../models/app_config.dart';
+import '../models/cloud_provider.dart';
 import '../models/cloud_secrets.dart';
 import '../models/recording_segment.dart';
 
@@ -57,6 +58,31 @@ class BackendUploadResult {
   bool get isSuccess => remoteKey != null;
 }
 
+class BackendPermanentSaveResult {
+  const BackendPermanentSaveResult.success(this.remoteKeysBySegmentId)
+    : error = null;
+
+  const BackendPermanentSaveResult.failure(this.error)
+    : remoteKeysBySegmentId = const {};
+
+  final Map<String, String> remoteKeysBySegmentId;
+  final String? error;
+
+  bool get isSuccess => error == null;
+}
+
+class DeviceRegistration {
+  const DeviceRegistration({
+    required this.accountId,
+    required this.deviceId,
+    required this.deviceToken,
+  });
+
+  final String accountId;
+  final String deviceId;
+  final String deviceToken;
+}
+
 class SoundRecorderBackendClient {
   SoundRecorderBackendClient({
     http.Client? httpClient,
@@ -82,6 +108,8 @@ class SoundRecorderBackendClient {
             'channelCount': config.channels,
             'segmentDurationSeconds': config.segmentDuration.inSeconds,
             'maxSegmentBytes': _maxSegmentBytes(config),
+            'useCase': config.useCase,
+            'audioProfile': config.audioProfile,
             'metaData': {
               'overlapSeconds': config.overlapSeconds,
               'overlapSamples': config.overlapSamples,
@@ -246,6 +274,295 @@ class SoundRecorderBackendClient {
     }
   }
 
+  Future<BackendPermanentSaveResult> saveSegmentsPermanently({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required DateTime rangeStartedAtUtc,
+    required DateTime rangeEndedAtUtc,
+    required List<RecordingSegment> segments,
+  }) async {
+    if (segments.isEmpty) {
+      return const BackendPermanentSaveResult.failure(
+        'No uploaded segments were available for permanent save.',
+      );
+    }
+    try {
+      final uri = _apiUri(config, '/api/mobile/v1/permanent-saves');
+      final response = await _httpClient
+          .post(
+            uri,
+            headers: _jsonHeaders(secrets),
+            body: jsonEncode({
+              'provider': canonicalProviderName(config.cloudProvider),
+              'rangeStartedAt': rangeStartedAtUtc.toIso8601String(),
+              'rangeEndedAt': rangeEndedAtUtc.toIso8601String(),
+              'segments': segments
+                  .map(
+                    (segment) => {
+                      'id': segment.id,
+                      'storageKey': segment.remoteKey,
+                      'sequenceNumber': segment.sequence,
+                      'capturedStartedAt': segment.startedAtUtc
+                          .toIso8601String(),
+                      'capturedEndedAt': segment.endedAtUtc.toIso8601String(),
+                      'durationMillis':
+                          segment.canonicalDuration.inMilliseconds,
+                      'contentType': segment.contentType,
+                      'codec': segment.codec,
+                      'byteCount': segment.byteSize,
+                      'metaData': {
+                        'captureSessionId': segment.captureSessionId,
+                        'startSample': segment.startSample,
+                        'sampleCount': segment.sampleCount,
+                        'storedSampleCount': segment.effectiveStoredSampleCount,
+                        'overlapSamples': segment.overlapSamples,
+                        'sampleRate': segment.sampleRate,
+                        'channels': segment.channels,
+                      },
+                    },
+                  )
+                  .toList(),
+            }),
+          )
+          .timeout(requestTimeout);
+      final body = _decode(response);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return BackendPermanentSaveResult.failure(
+          _errorMessage(body, 'Permanent save failed.'),
+        );
+      }
+      final remoteKeys = _permanentRemoteKeys(body);
+      if (remoteKeys.isEmpty) {
+        return const BackendPermanentSaveResult.failure(
+          'Permanent save did not return storage keys.',
+        );
+      }
+      return BackendPermanentSaveResult.success(remoteKeys);
+    } on TimeoutException {
+      return BackendPermanentSaveResult.failure(
+        'Permanent save timed out after ${requestTimeout.inSeconds} seconds.',
+      );
+    } catch (error) {
+      return BackendPermanentSaveResult.failure(
+        'Permanent save failed: $error',
+      );
+    }
+  }
+
+  /// Registers (or rotates) this device and returns the issued device token.
+  /// Identity is taken from the `x-supabase-auth` header when a Supabase token
+  /// is present; otherwise the backend's registration posture applies.
+  Future<DeviceRegistration> registerDevice({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required String platform,
+    required String installId,
+    required String consentVersion,
+    bool recordingIndicatorAcknowledged = true,
+    String? appVersion,
+    String? osVersion,
+    String? displayName,
+    String? legalRegion,
+  }) async {
+    final uri = _apiUri(config, '/api/mobile/v1/devices/register');
+    final response = await _httpClient
+        .post(
+          uri,
+          headers: _identityHeaders(secrets),
+          body: jsonEncode({
+            'platform': platform,
+            'installId': installId,
+            'consentVersion': consentVersion,
+            'recordingIndicatorAcknowledged': recordingIndicatorAcknowledged,
+            if (appVersion != null) 'appVersion': appVersion,
+            if (osVersion != null) 'osVersion': osVersion,
+            if (displayName != null) 'displayName': displayName,
+            if (legalRegion != null) 'legalRegion': legalRegion,
+          }),
+        )
+        .timeout(requestTimeout);
+    final body = _decode(response);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(_errorMessage(body, 'Device registration failed.'));
+    }
+    final deviceToken = body['deviceToken'] as String?;
+    if (deviceToken == null || deviceToken.trim().isEmpty) {
+      throw StateError('Registration did not return a device token.');
+    }
+    return DeviceRegistration(
+      accountId: body['accountId'] as String? ?? '',
+      deviceId: body['deviceId'] as String? ?? '',
+      deviceToken: deviceToken,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> listCloudConnections({
+    required AppConfig config,
+    required CloudSecrets secrets,
+  }) async {
+    final uri = _apiUri(config, '/api/mobile/v1/cloud-connections');
+    final response = await _httpClient
+        .get(uri, headers: _jsonHeaders(secrets))
+        .timeout(requestTimeout);
+    final body = _decode(response);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(_errorMessage(body, 'Listing cloud connections failed.'));
+    }
+    return _mapList(body['connections']);
+  }
+
+  /// Begins a cloud link. Returns the parsed `oauth/start` response (state,
+  /// authorizationUrl, requiredScope, ...).
+  Future<Map<String, dynamic>> startCloudLink({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required CloudProvider provider,
+    String? redirectUri,
+    String? folderPath,
+    String? rootFolderId,
+    String? displayName,
+  }) async {
+    final uri = _apiUri(config, '/api/mobile/v1/cloud-connections/oauth/start');
+    final response = await _httpClient
+        .post(
+          uri,
+          headers: _jsonHeaders(secrets),
+          body: jsonEncode({
+            'provider': canonicalProviderName(provider),
+            if (redirectUri != null) 'redirectUri': redirectUri,
+            if (folderPath != null) 'folderPath': folderPath,
+            if (rootFolderId != null) 'rootFolderId': rootFolderId,
+            if (displayName != null) 'displayName': displayName,
+          }),
+        )
+        .timeout(requestTimeout);
+    final body = _decode(response);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(_errorMessage(body, 'Starting cloud link failed.'));
+    }
+    return body;
+  }
+
+  /// Completes a cloud link. For Google Drive / OneDrive pass either a
+  /// Supabase-brokered [providerAccessToken] (preferred) or an
+  /// [authorizationCode]. For iCloud pass [clientManagedAcknowledged] = true.
+  Future<Map<String, dynamic>> completeCloudLink({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required CloudProvider provider,
+    required String state,
+    String? providerAccessToken,
+    String? providerRefreshToken,
+    int? providerTokenExpiresIn,
+    String? providerTokenScope,
+    String? authorizationCode,
+    String? redirectUri,
+    bool? clientManagedAcknowledged,
+    String? displayName,
+    String? providerAccountId,
+    String? folderPath,
+    String? rootFolderId,
+  }) async {
+    final uri = _apiUri(
+      config,
+      '/api/mobile/v1/cloud-connections/oauth/complete',
+    );
+    final response = await _httpClient
+        .post(
+          uri,
+          headers: _jsonHeaders(secrets),
+          body: jsonEncode({
+            'provider': canonicalProviderName(provider),
+            'state': state,
+            if (providerAccessToken != null)
+              'providerAccessToken': providerAccessToken,
+            if (providerRefreshToken != null)
+              'providerRefreshToken': providerRefreshToken,
+            if (providerTokenExpiresIn != null)
+              'providerTokenExpiresIn': providerTokenExpiresIn,
+            if (providerTokenScope != null)
+              'providerTokenScope': providerTokenScope,
+            if (authorizationCode != null)
+              'authorizationCode': authorizationCode,
+            if (redirectUri != null) 'redirectUri': redirectUri,
+            if (clientManagedAcknowledged != null)
+              'clientManagedAcknowledged': clientManagedAcknowledged,
+            if (displayName != null) 'displayName': displayName,
+            if (providerAccountId != null)
+              'providerAccountId': providerAccountId,
+            if (folderPath != null) 'folderPath': folderPath,
+            if (rootFolderId != null) 'rootFolderId': rootFolderId,
+          }),
+        )
+        .timeout(requestTimeout);
+    final body = _decode(response);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(_errorMessage(body, 'Completing cloud link failed.'));
+    }
+    return body;
+  }
+
+  /// Lists iCloud client-managed copy jobs the iOS client must mirror into the
+  /// user's iCloud container, each with a short-lived S3 download link.
+  Future<List<Map<String, dynamic>>> listCloudCopyJobs({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    CloudProvider provider = CloudProvider.iCloudDrive,
+    int limit = 25,
+  }) async {
+    final uri = _apiUri(config, '/api/mobile/v1/cloud-copy-jobs').replace(
+      queryParameters: {
+        'provider': canonicalProviderName(provider),
+        'limit': '$limit',
+      },
+    );
+    final response = await _httpClient
+        .get(uri, headers: _jsonHeaders(secrets))
+        .timeout(requestTimeout);
+    final body = _decode(response);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(_errorMessage(body, 'Listing cloud copy jobs failed.'));
+    }
+    return _mapList(body['jobs']);
+  }
+
+  /// Marks a client-managed (iCloud) copy job complete after the native layer
+  /// has written the file into the user's iCloud container.
+  Future<void> completeCloudCopyJob({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required String jobId,
+    String? providerFileId,
+    String? destinationKey,
+  }) async {
+    final uri = _apiUri(
+      config,
+      '/api/mobile/v1/cloud-copy-jobs/$jobId/complete',
+    );
+    final response = await _httpClient
+        .post(
+          uri,
+          headers: _jsonHeaders(secrets),
+          body: jsonEncode({
+            if (providerFileId != null) 'providerFileId': providerFileId,
+            if (destinationKey != null) 'destinationKey': destinationKey,
+          }),
+        )
+        .timeout(requestTimeout);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(
+        _errorMessage(_decode(response), 'Completing cloud copy job failed.'),
+      );
+    }
+  }
+
+  List<Map<String, dynamic>> _mapList(Object? value) {
+    if (value is! List) {
+      return const [];
+    }
+    return value.whereType<Map<String, dynamic>>().toList();
+  }
+
   bool canUseBackend(AppConfig config, CloudSecrets secrets) {
     return config.backendBaseUrl.trim().isNotEmpty &&
         secrets.hasBackendDeviceToken;
@@ -275,11 +592,45 @@ class SoundRecorderBackendClient {
   }
 
   Map<String, String> _jsonHeaders(CloudSecrets secrets) {
-    return {
+    final headers = <String, String>{
       'authorization': 'Bearer ${secrets.backendDeviceToken.trim()}',
       'content-type': 'application/json',
       'accept': 'application/json',
     };
+    if (secrets.hasSupabaseToken) {
+      headers['x-supabase-auth'] = 'Bearer ${secrets.supabaseAccessToken.trim()}';
+    }
+    return headers;
+  }
+
+  /// Headers for identity-only calls (registration / cloud linking) that are
+  /// authorized by the Supabase token rather than a device token.
+  Map<String, String> _identityHeaders(CloudSecrets secrets) {
+    final headers = <String, String>{
+      'content-type': 'application/json',
+      'accept': 'application/json',
+    };
+    if (secrets.hasSupabaseToken) {
+      headers['x-supabase-auth'] = 'Bearer ${secrets.supabaseAccessToken.trim()}';
+    }
+    if (secrets.hasBackendDeviceToken) {
+      headers['authorization'] = 'Bearer ${secrets.backendDeviceToken.trim()}';
+    }
+    return headers;
+  }
+
+  /// Maps the app's provider enum to the backend's canonical provider strings.
+  static String canonicalProviderName(CloudProvider provider) {
+    switch (provider) {
+      case CloudProvider.googleDrive:
+        return 'google_drive';
+      case CloudProvider.oneDrive:
+        return 'microsoft_onedrive';
+      case CloudProvider.iCloudDrive:
+        return 'apple_icloud';
+      case CloudProvider.s3:
+        return 's3';
+    }
   }
 
   Map<String, String> _signedTransferHeaders(Map<String, dynamic> upload) {
@@ -340,6 +691,35 @@ class SoundRecorderBackendClient {
   String _errorMessage(Map<String, dynamic> body, String fallback) {
     final message = body['message'] ?? body['error'];
     return message?.toString() ?? fallback;
+  }
+
+  Map<String, String> _permanentRemoteKeys(Map<String, dynamic> body) {
+    final rawSegments =
+        body['segments'] ??
+        (body['permanentSave'] is Map<String, dynamic>
+            ? (body['permanentSave'] as Map<String, dynamic>)['segments']
+            : null);
+    final remoteKeys = <String, String>{};
+    if (rawSegments is! List<dynamic>) {
+      return remoteKeys;
+    }
+    for (final rawSegment in rawSegments) {
+      if (rawSegment is! Map<String, dynamic>) {
+        continue;
+      }
+      final id =
+          rawSegment['id'] ??
+          rawSegment['segmentId'] ??
+          rawSegment['clientSegmentId'];
+      final key =
+          rawSegment['permanentStorageKey'] ??
+          rawSegment['permanentRemoteKey'] ??
+          rawSegment['storageKey'];
+      if (id != null && key != null && key.toString().trim().isNotEmpty) {
+        remoteKeys[id.toString()] = key.toString();
+      }
+    }
+    return remoteKeys;
   }
 
   DateTime? _dateTime(Object? value) {

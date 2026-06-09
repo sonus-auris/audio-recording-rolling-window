@@ -40,6 +40,22 @@ void main() {
     expect(viewModel.canUploadToSelectedProvider, isTrue);
   });
 
+  test(
+    'allows permanent save for backend providers when backend is configured',
+    () {
+      final viewModel = _viewModel(
+        config: const AppConfig(
+          deviceId: 'device-a',
+          cloudProvider: CloudProvider.iCloudDrive,
+          backendBaseUrl: 'https://backend.example',
+        ),
+        secrets: const CloudSecrets(backendDeviceToken: 'device-token'),
+      );
+
+      expect(viewModel.canSavePermanently, isTrue);
+    },
+  );
+
   test('counts the active recording segment in the local window', () {
     final startedAtUtc = DateTime.now().toUtc().subtract(
       const Duration(seconds: 12),
@@ -54,6 +70,25 @@ void main() {
 
     expect(viewModel.localWindowDuration.inSeconds, greaterThanOrEqualTo(11));
     expect(viewModel.localWindowBytes, greaterThan(0));
+  });
+
+  test('tracks permanently saved segment bytes separately', () {
+    final startedAtUtc = DateTime.utc(2026, 1, 2, 3, 4, 5);
+    final viewModel = _viewModel(
+      segments: [
+        RecordingSegment(
+          id: 'segment-1',
+          startedAtUtc: startedAtUtc,
+          endedAtUtc: startedAtUtc.add(const Duration(minutes: 1)),
+          byteSize: 4,
+          uploadStatus: SegmentUploadStatus.localOnly,
+          permanentRemoteKey: 'permanent/segment-1.wav',
+        ),
+      ],
+    );
+
+    expect(viewModel.permanentSegmentCount, 1);
+    expect(viewModel.permanentBytes, 4);
   });
 }
 
