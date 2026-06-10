@@ -9,8 +9,11 @@ import '../models/cloud_provider.dart';
 import '../models/cloud_secrets.dart';
 import '../models/playback_snapshot.dart';
 import '../models/recorder_snapshot.dart';
+import '../models/cloud_connection.dart';
 import '../models/recording_segment.dart';
+import '../models/supabase_session.dart';
 import '../services/background_capture_service.dart';
+import '../services/icloud_sync_service.dart';
 import '../services/diagnostic_log.dart';
 import '../services/playback_service.dart';
 import '../services/recording_feedback.dart';
@@ -19,7 +22,12 @@ import '../services/segment_index.dart';
 import '../services/segment_recorder.dart';
 import '../services/settings_store.dart';
 import '../services/sound_recorder_backend_client.dart';
+import '../services/supabase_auth_client.dart';
 import 'app_view_model.dart';
+
+/// Consent string recorded against the device on registration. Bump when the
+/// recording/privacy disclosure shown to the user materially changes.
+const String kConsentVersion = 'audio-dashcam-consent-v1';
 
 class AppController {
   factory AppController({
@@ -30,6 +38,8 @@ class AppController {
     BackgroundCaptureService? backgroundCaptureService,
     S3StorageClient? s3StorageClient,
     SoundRecorderBackendClient? backendClient,
+    SupabaseAuthClient? authClient,
+    IcloudSyncService? icloudSyncService,
     DiagnosticLog? diagnosticLog,
     RecordingFeedback? feedback,
   }) {
@@ -46,6 +56,8 @@ class AppController {
           BackgroundCaptureService(diagnostics: effectiveDiagnostics),
       s3StorageClient: s3StorageClient ?? S3StorageClient(),
       backendClient: backendClient ?? SoundRecorderBackendClient(),
+      authClient: authClient ?? SupabaseAuthClient(),
+      icloudSyncService: icloudSyncService ?? IcloudSyncService(),
       diagnostics: effectiveDiagnostics,
       feedback: feedback ?? RecordingFeedback(),
     );
@@ -59,6 +71,8 @@ class AppController {
     required this._backgroundCaptureService,
     required this._s3StorageClient,
     required this._backendClient,
+    required this._authClient,
+    required this._icloudSyncService,
     required this._diagnostics,
     required this._feedback,
   }) {
@@ -118,8 +132,13 @@ class AppController {
   final BackgroundCaptureService _backgroundCaptureService;
   final S3StorageClient _s3StorageClient;
   final SoundRecorderBackendClient _backendClient;
+  final SupabaseAuthClient _authClient;
+  final IcloudSyncService _icloudSyncService;
   final DiagnosticLog _diagnostics;
   final RecordingFeedback _feedback;
+  Future<void>? _deviceRegistrationInFlight;
+  Future<void>? _supabaseRefreshInFlight;
+  Future<void>? _icloudSyncInFlight;
 
   final BehaviorSubject<AppConfig> _config = BehaviorSubject();
   final BehaviorSubject<CloudSecrets> _secrets = BehaviorSubject();
@@ -184,6 +203,7 @@ class AppController {
         );
     _isInitializing.add(false);
     _diagnostics.add('App controller init completed.');
+    await _ensureSupabaseReady();
     requestUploadDrain();
     await _enforceRetention();
   }
@@ -230,15 +250,14 @@ class AppController {
   }
 
   Future<void> saveSecrets(CloudSecrets secrets) async {
-    final normalized = CloudSecrets(
+    // copyWith (not a fresh constructor) so Supabase session fields — which have
+    // no settings form — are always carried through; reconstructing the object
+    // by hand previously dropped them and erased the stored identity token.
+    final normalized = secrets.copyWith(
       s3AccessKeyId: secrets.s3AccessKeyId.trim(),
       s3SecretAccessKey: secrets.s3SecretAccessKey.trim(),
       s3SessionToken: secrets.s3SessionToken.trim(),
       backendDeviceToken: secrets.backendDeviceToken.trim(),
-      // Must be carried through: dropping it here deletes the persisted Supabase
-      // identity token (it has no settings form field), which silently demotes
-      // the device to install-id auth on the next backend call.
-      supabaseAccessToken: secrets.supabaseAccessToken.trim(),
     );
     if (_backendSessionKey != _sessionKey(_config.valueOrNull, normalized)) {
       _backendSession = null;
@@ -247,7 +266,261 @@ class AppController {
     await _settingsStore.saveSecrets(normalized);
     _secrets.add(normalized);
     _message.add('Cloud credentials saved.');
+    await _ensureSupabaseReady();
     requestUploadDrain();
+  }
+
+  /// Signs in with Supabase email/password and, on success, registers the device
+  /// with the backend so uploads run under the verified identity.
+  Future<void> signInWithSupabase({
+    required String email,
+    required String password,
+  }) {
+    return _authenticateSupabase(
+      () => _authClient.signInWithPassword(
+        config: _config.value,
+        email: email,
+        password: password,
+      ),
+      successMessage: 'Signed in.',
+    );
+  }
+
+  /// Creates a Supabase account. When the project requires email confirmation
+  /// the returned session is null and the user must confirm, then sign in.
+  Future<void> signUpWithSupabase({
+    required String email,
+    required String password,
+  }) {
+    return _authenticateSupabase(
+      () => _authClient.signUp(
+        config: _config.value,
+        email: email,
+        password: password,
+      ),
+      successMessage: 'Signed in.',
+      pendingMessage: 'Account created. Confirm your email, then sign in.',
+    );
+  }
+
+  /// Revokes the Supabase session (best-effort server-side) and clears the
+  /// stored identity and device token so the next sign-in re-registers cleanly.
+  Future<void> signOutSupabase() async {
+    final secrets = _secrets.valueOrNull;
+    if (secrets != null && secrets.hasSupabaseToken && _config.hasValue) {
+      await _authClient.signOut(
+        config: _config.value,
+        accessToken: secrets.supabaseAccessToken,
+      );
+    }
+    // Drop the device token too: it is bound to the signed-out account, so a
+    // different user signing in on this device must get a fresh registration.
+    final cleared = (secrets ?? const CloudSecrets())
+        .withoutSupabaseSession()
+        .copyWith(backendDeviceToken: '');
+    _backendSession = null;
+    _backendSessionKey = null;
+    await _persistSecrets(cleared);
+    _message.add('Signed out.');
+  }
+
+  Future<void> _authenticateSupabase(
+    Future<SupabaseSession?> Function() run, {
+    required String successMessage,
+    String? pendingMessage,
+  }) async {
+    if (!_config.hasValue) {
+      return;
+    }
+    if (!_config.value.hasSupabaseAuthConfig) {
+      _message.add('Set the Supabase URL and anon key before signing in.');
+      return;
+    }
+    try {
+      final session = await run();
+      if (session == null) {
+        _message.add(pendingMessage ?? successMessage);
+        return;
+      }
+      await _applySupabaseSession(session);
+      await _ensureDeviceRegistered();
+      _message.add(successMessage);
+      requestUploadDrain();
+    } catch (error) {
+      _message.add(_describeError(error));
+    }
+  }
+
+  Future<void> _applySupabaseSession(SupabaseSession session) async {
+    final current = _secrets.valueOrNull ?? const CloudSecrets();
+    // A refresh response often omits the user object; keep the known email then.
+    final email = session.email.trim().isEmpty
+        ? current.supabaseEmail
+        : session.email;
+    // Never blank an existing refresh token if the response omitted one — that
+    // would strand us with no way to refresh again until the next manual login.
+    final refreshToken = session.refreshToken.trim().isEmpty
+        ? current.supabaseRefreshToken
+        : session.refreshToken;
+    // If a *different* user signed in, the existing device token belongs to the
+    // previous account — drop it so the next backend call re-registers under the
+    // new identity instead of writing this user's audio into the old account.
+    final identityChanged =
+        current.supabaseEmail.trim().isNotEmpty &&
+        session.email.trim().isNotEmpty &&
+        current.supabaseEmail.trim().toLowerCase() !=
+            session.email.trim().toLowerCase();
+    var next = current.copyWith(
+      supabaseAccessToken: session.accessToken,
+      supabaseRefreshToken: refreshToken,
+      supabaseAccessTokenExpiresAt: session.expiresAtUtc
+          .toUtc()
+          .toIso8601String(),
+      supabaseEmail: email,
+    );
+    if (identityChanged) {
+      next = next.copyWith(backendDeviceToken: '');
+      _backendSession = null;
+      _backendSessionKey = null;
+    }
+    await _persistSecrets(next);
+  }
+
+  Future<void> _persistSecrets(CloudSecrets secrets) async {
+    if (_backendSessionKey != _sessionKey(_config.valueOrNull, secrets)) {
+      _backendSession = null;
+      _backendSessionKey = null;
+    }
+    await _settingsStore.saveSecrets(secrets);
+    _secrets.add(secrets);
+  }
+
+  Future<void> _ensureSupabaseReady() async {
+    await _ensureFreshSupabaseToken();
+    await _ensureDeviceRegistered();
+  }
+
+  /// Silently refreshes the Supabase access token when it is missing or near
+  /// expiry, rotating the stored refresh token. De-duplicated so concurrent
+  /// backend operations don't each spend (and invalidate) the rotating token.
+  Future<void> _ensureFreshSupabaseToken() async {
+    if (!_config.hasValue) {
+      return;
+    }
+    final config = _config.value;
+    final secrets = _secrets.valueOrNull;
+    if (secrets == null ||
+        !secrets.hasSupabaseRefreshToken ||
+        !secrets.supabaseTokenNeedsRefresh() ||
+        !config.hasSupabaseAuthConfig) {
+      return;
+    }
+    final inFlight = _supabaseRefreshInFlight;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+    final future = _refreshSupabaseToken(config, secrets.supabaseRefreshToken);
+    _supabaseRefreshInFlight = future;
+    try {
+      await future;
+    } finally {
+      _supabaseRefreshInFlight = null;
+    }
+  }
+
+  Future<void> _refreshSupabaseToken(
+    AppConfig config,
+    String refreshToken,
+  ) async {
+    try {
+      final session = await _authClient.refreshSession(
+        config: config,
+        refreshToken: refreshToken,
+      );
+      await _applySupabaseSession(session);
+      _diagnostics.add('Supabase access token refreshed.');
+    } catch (error) {
+      _diagnostics.add(
+        'Supabase token refresh failed: ${_describeError(error)}',
+      );
+    }
+  }
+
+  /// Registers the device with the backend once a Supabase session exists and no
+  /// device token is held yet. De-duplicated so concurrent callers share one
+  /// in-flight request.
+  Future<void> _ensureDeviceRegistered() async {
+    if (!_config.hasValue) {
+      return;
+    }
+    final config = _config.value;
+    final secrets = _secrets.valueOrNull ?? const CloudSecrets();
+    if (config.backendBaseUrl.trim().isEmpty ||
+        !secrets.hasSupabaseToken ||
+        secrets.hasBackendDeviceToken) {
+      return;
+    }
+    final inFlight = _deviceRegistrationInFlight;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+    final future = _registerDevice(config, secrets);
+    _deviceRegistrationInFlight = future;
+    try {
+      await future;
+    } finally {
+      _deviceRegistrationInFlight = null;
+    }
+  }
+
+  Future<void> _registerDevice(AppConfig config, CloudSecrets secrets) async {
+    try {
+      final registration = await _backendClient.registerDevice(
+        config: config,
+        secrets: secrets,
+        platform: _platformName(),
+        installId: config.deviceId,
+        consentVersion: kConsentVersion,
+      );
+      if (registration.deviceToken.trim().isEmpty) {
+        return;
+      }
+      final updated = (_secrets.valueOrNull ?? secrets).copyWith(
+        backendDeviceToken: registration.deviceToken.trim(),
+      );
+      await _persistSecrets(updated);
+      _diagnostics.add('Device registered with backend.');
+      requestUploadDrain();
+    } catch (error) {
+      _diagnostics.add(
+        'Device registration failed: ${_describeError(error)}',
+      );
+    }
+  }
+
+  String _platformName() {
+    if (Platform.isIOS) {
+      return 'ios';
+    }
+    if (Platform.isAndroid) {
+      return 'android';
+    }
+    if (Platform.isMacOS) {
+      return 'macos';
+    }
+    return 'other';
+  }
+
+  String _describeError(Object error) {
+    if (error is StateError) {
+      return error.message;
+    }
+    if (error is FormatException) {
+      return error.message;
+    }
+    return error.toString();
   }
 
   Future<void> startRecording() async {
@@ -316,6 +589,8 @@ class AppController {
       _message.add('End timestamp must be after start timestamp.');
       return;
     }
+    await _ensureFreshSupabaseToken();
+    await _ensureDeviceRegistered();
     final config = _config.value;
     final secrets = _secrets.value;
     final useBackend = _backendClient.canUseBackend(config, secrets);
@@ -405,6 +680,189 @@ class AppController {
     }
   }
 
+  /// Validates that the backend is reachable and the device is registered, and
+  /// refreshes the Supabase token, returning the context for a cloud-link call.
+  Future<({AppConfig config, CloudSecrets secrets})?> _backendContext(
+    String action,
+  ) async {
+    if (!_config.hasValue || !_secrets.hasValue) {
+      return null;
+    }
+    final config = _config.value;
+    if (config.backendBaseUrl.trim().isEmpty ||
+        !_secrets.value.hasBackendDeviceToken) {
+      _message.add('Sign in and register the device before $action.');
+      return null;
+    }
+    await _ensureFreshSupabaseToken();
+    return (config: config, secrets: _secrets.value);
+  }
+
+  Future<List<CloudConnection>> loadCloudConnections() async {
+    final ctx = await _backendContext('viewing cloud links');
+    if (ctx == null) {
+      return const [];
+    }
+    final rows = await _backendClient.listCloudConnections(
+      config: ctx.config,
+      secrets: ctx.secrets,
+    );
+    return rows
+        .map(CloudConnection.fromJson)
+        .where((connection) => connection.id.isNotEmpty)
+        .toList();
+  }
+
+  /// Links Apple iCloud (client-managed): the server records the destination and
+  /// begins emitting copy jobs the device mirrors via [syncIcloudBackups].
+  Future<void> linkICloud() async {
+    final ctx = await _backendContext('linking iCloud');
+    if (ctx == null) {
+      return;
+    }
+    try {
+      final start = CloudLinkStart.fromJson(
+        await _backendClient.startCloudLink(
+          config: ctx.config,
+          secrets: ctx.secrets,
+          provider: CloudProvider.iCloudDrive,
+        ),
+      );
+      await _backendClient.completeCloudLink(
+        config: ctx.config,
+        secrets: ctx.secrets,
+        provider: CloudProvider.iCloudDrive,
+        state: start.state,
+        clientManagedAcknowledged: true,
+      );
+      _message.add('iCloud linked. Recordings will mirror to your iCloud.');
+      unawaited(syncIcloudBackups());
+    } catch (error) {
+      _message.add('iCloud link failed: ${_describeError(error)}');
+    }
+  }
+
+  /// Starts a server-managed (Google Drive / OneDrive) link and returns the
+  /// authorization details the UI shows the user to grant access.
+  Future<CloudLinkStart?> startProviderLink(
+    CloudProvider provider, {
+    String? redirectUri,
+  }) async {
+    final ctx = await _backendContext('linking ${provider.label}');
+    if (ctx == null) {
+      return null;
+    }
+    try {
+      return CloudLinkStart.fromJson(
+        await _backendClient.startCloudLink(
+          config: ctx.config,
+          secrets: ctx.secrets,
+          provider: provider,
+          redirectUri: redirectUri,
+        ),
+      );
+    } catch (error) {
+      _message.add('Starting ${provider.label} link failed: '
+          '${_describeError(error)}');
+      return null;
+    }
+  }
+
+  /// Completes a server-managed link with the authorization code the user pasted
+  /// back after granting access in the browser.
+  Future<bool> completeProviderLink({
+    required CloudProvider provider,
+    required String state,
+    required String authorizationCode,
+    String? redirectUri,
+  }) async {
+    final ctx = await _backendContext('linking ${provider.label}');
+    if (ctx == null) {
+      return false;
+    }
+    try {
+      await _backendClient.completeCloudLink(
+        config: ctx.config,
+        secrets: ctx.secrets,
+        provider: provider,
+        state: state,
+        authorizationCode: authorizationCode,
+        redirectUri: redirectUri,
+      );
+      _message.add('${provider.label} linked.');
+      requestUploadDrain();
+      return true;
+    } catch (error) {
+      _message.add('${provider.label} link failed: ${_describeError(error)}');
+      return false;
+    }
+  }
+
+  Future<void> revokeCloudConnection(String connectionId) async {
+    final ctx = await _backendContext('updating cloud links');
+    if (ctx == null) {
+      return;
+    }
+    try {
+      await _backendClient.revokeCloudConnection(
+        config: ctx.config,
+        secrets: ctx.secrets,
+        connectionId: connectionId,
+      );
+      _message.add('Cloud connection removed.');
+    } catch (error) {
+      _message.add('Removing connection failed: ${_describeError(error)}');
+    }
+  }
+
+  /// Drains pending iCloud copy jobs through the native layer. Safe to call
+  /// often; it no-ops unless iCloud is the selected provider and reachable.
+  /// De-duplicated so overlapping callers (every upload drain triggers one)
+  /// don't download and write the same jobs twice in parallel.
+  Future<void> syncIcloudBackups() async {
+    final inFlight = _icloudSyncInFlight;
+    if (inFlight != null) {
+      return inFlight;
+    }
+    final future = _syncIcloudBackups();
+    _icloudSyncInFlight = future;
+    try {
+      await future;
+    } finally {
+      _icloudSyncInFlight = null;
+    }
+  }
+
+  Future<void> _syncIcloudBackups() async {
+    if (!_config.hasValue || !_secrets.hasValue) {
+      return;
+    }
+    final config = _config.value;
+    if (config.cloudProvider != CloudProvider.iCloudDrive) {
+      return;
+    }
+    if (config.backendBaseUrl.trim().isEmpty ||
+        !_secrets.value.hasBackendDeviceToken) {
+      return;
+    }
+    await _ensureFreshSupabaseToken();
+    final result = await _icloudSyncService.syncPendingJobs(
+      backendClient: _backendClient,
+      config: config,
+      secrets: _secrets.value,
+    );
+    if (result.skipped) {
+      return;
+    }
+    if (result.error != null) {
+      _diagnostics.add('iCloud sync: ${result.error}');
+    } else if (result.completed > 0 || result.failed > 0) {
+      _diagnostics.add(
+        'iCloud sync: ${result.completed} copied, ${result.failed} failed.',
+      );
+    }
+  }
+
   void requestUploadDrain() {
     if (!_uploadRequests.isClosed) {
       _uploadRequests.add(null);
@@ -423,7 +881,9 @@ class AppController {
     await _recorder.dispose();
     await _playback.dispose();
     _s3StorageClient.close();
+    _icloudSyncService.close();
     _backendClient.close();
+    _authClient.close();
     await _feedback.dispose();
     await _diagnostics.dispose();
     await _config.close();
@@ -449,11 +909,15 @@ class AppController {
     if (!_config.hasValue || !_secrets.hasValue) {
       return;
     }
-    final config = _config.value;
-    final secrets = _secrets.value;
-    if (!config.uploadEnabled) {
+    if (!_config.value.uploadEnabled) {
       return;
     }
+    // Refresh identity / registration before reading secrets so the upload runs
+    // with a non-expired Supabase token and a device token if one is available.
+    await _ensureFreshSupabaseToken();
+    await _ensureDeviceRegistered();
+    final config = _config.value;
+    final secrets = _secrets.value;
     final segments = await _segmentIndex.loadSegments();
     final pending =
         segments
@@ -538,6 +1002,9 @@ class AppController {
       );
       await _flushPendingAlerts();
       await _enforceRetention();
+      // Mirror freshly uploaded segments into the user's iCloud (no-op unless
+      // iCloud is the selected provider).
+      unawaited(syncIcloudBackups());
     } catch (error) {
       _message.add('Upload queue failed: $error');
     } finally {
@@ -735,6 +1202,7 @@ class AppController {
     if (!_config.hasValue || !_secrets.hasValue) {
       return;
     }
+    await _ensureFreshSupabaseToken();
     final config = _config.value;
     final secrets = _secrets.value;
     if (!_backendClient.canUseBackend(config, secrets)) {

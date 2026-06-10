@@ -28,6 +28,11 @@ class SettingsStore {
   static const _s3SessionTokenKey = 'audio_dashcam.s3.session_token';
   static const _backendDeviceTokenKey = 'audio_dashcam.backend.device_token';
   static const _supabaseAccessTokenKey = 'audio_dashcam.supabase.access_token';
+  static const _supabaseRefreshTokenKey =
+      'audio_dashcam.supabase.refresh_token';
+  static const _supabaseTokenExpiresAtKey =
+      'audio_dashcam.supabase.token_expires_at';
+  static const _supabaseEmailKey = 'audio_dashcam.supabase.email';
 
   final FlutterSecureStorage _secureStorage;
   final Uuid _uuid;
@@ -93,6 +98,11 @@ class SettingsStore {
           await _secureStorage.read(key: _backendDeviceTokenKey) ?? '',
       supabaseAccessToken:
           await _secureStorage.read(key: _supabaseAccessTokenKey) ?? '',
+      supabaseRefreshToken:
+          await _secureStorage.read(key: _supabaseRefreshTokenKey) ?? '',
+      supabaseAccessTokenExpiresAt:
+          await _secureStorage.read(key: _supabaseTokenExpiresAtKey) ?? '',
+      supabaseEmail: await _secureStorage.read(key: _supabaseEmailKey) ?? '',
     );
   }
 
@@ -102,6 +112,12 @@ class SettingsStore {
     await _writeSecure(_s3SessionTokenKey, secrets.s3SessionToken);
     await _writeSecure(_backendDeviceTokenKey, secrets.backendDeviceToken);
     await _writeSecure(_supabaseAccessTokenKey, secrets.supabaseAccessToken);
+    await _writeSecure(_supabaseRefreshTokenKey, secrets.supabaseRefreshToken);
+    await _writeSecure(
+      _supabaseTokenExpiresAtKey,
+      secrets.supabaseAccessTokenExpiresAt,
+    );
+    await _writeSecure(_supabaseEmailKey, secrets.supabaseEmail);
   }
 
   Future<void> _writeSecure(String key, String value) async {

@@ -17,6 +17,8 @@ class AppConfig {
     this.s3Region = 'us-east-1',
     this.s3Prefix = 'audio-dashcam',
     this.s3Endpoint = '',
+    this.supabaseUrl = '',
+    this.supabaseAnonKey = '',
     this.useCase = 'security',
     this.micSensitivity = 1.0,
     this.noiseTriggerSensitivity = 0.5,
@@ -53,6 +55,14 @@ class AppConfig {
   final String s3Region;
   final String s3Prefix;
   final String s3Endpoint;
+
+  /// Supabase project URL (e.g. https://abc.supabase.co). Used for GoTrue
+  /// email/password sign-in. Non-secret.
+  final String supabaseUrl;
+
+  /// Supabase anon/publishable API key. Safe to ship in the client; never the
+  /// service_role or secret key.
+  final String supabaseAnonKey;
 
   /// One of [supportedUseCases].
   final String useCase;
@@ -102,6 +112,10 @@ class AppConfig {
   bool get s3TargetReady =>
       s3Bucket.trim().isNotEmpty && s3Region.trim().isNotEmpty;
 
+  /// Whether Supabase email/password sign-in can be attempted.
+  bool get hasSupabaseAuthConfig =>
+      supabaseUrl.trim().isNotEmpty && supabaseAnonKey.trim().isNotEmpty;
+
   Duration get segmentDuration => Duration(minutes: segmentMinutes);
 
   int get bitsPerSample => 16;
@@ -134,6 +148,8 @@ class AppConfig {
     String? s3Region,
     String? s3Prefix,
     String? s3Endpoint,
+    String? supabaseUrl,
+    String? supabaseAnonKey,
     String? useCase,
     double? micSensitivity,
     double? noiseTriggerSensitivity,
@@ -160,6 +176,8 @@ class AppConfig {
       s3Region: s3Region ?? this.s3Region,
       s3Prefix: s3Prefix ?? this.s3Prefix,
       s3Endpoint: s3Endpoint ?? this.s3Endpoint,
+      supabaseUrl: supabaseUrl ?? this.supabaseUrl,
+      supabaseAnonKey: supabaseAnonKey ?? this.supabaseAnonKey,
       useCase: useCase ?? this.useCase,
       micSensitivity: micSensitivity ?? this.micSensitivity,
       noiseTriggerSensitivity:
@@ -190,6 +208,8 @@ class AppConfig {
       's3Region': s3Region,
       's3Prefix': s3Prefix,
       's3Endpoint': s3Endpoint,
+      'supabaseUrl': supabaseUrl,
+      'supabaseAnonKey': supabaseAnonKey,
       'useCase': useCase,
       'micSensitivity': micSensitivity,
       'noiseTriggerSensitivity': noiseTriggerSensitivity,
@@ -220,6 +240,8 @@ class AppConfig {
       s3Region: json['s3Region'] as String? ?? 'us-east-1',
       s3Prefix: json['s3Prefix'] as String? ?? 'audio-dashcam',
       s3Endpoint: json['s3Endpoint'] as String? ?? '',
+      supabaseUrl: json['supabaseUrl'] as String? ?? '',
+      supabaseAnonKey: json['supabaseAnonKey'] as String? ?? '',
       useCase: supportedUseCases.contains(useCase) ? useCase : 'security',
       micSensitivity: _asDouble(json['micSensitivity'], 1.0).clamp(0.25, 4.0),
       noiseTriggerSensitivity: _asDouble(

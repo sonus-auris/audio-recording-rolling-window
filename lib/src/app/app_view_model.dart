@@ -29,6 +29,25 @@ class AppViewModel {
   final bool isUploading;
   final String? message;
 
+  /// Whether a Supabase session (access or refresh token) is held.
+  bool get isSignedIn => secrets.hasSupabaseSession;
+
+  /// Email of the signed-in user, or null when signed out / unknown.
+  String? get signedInEmail =>
+      secrets.supabaseEmail.trim().isEmpty ? null : secrets.supabaseEmail.trim();
+
+  /// True once the device holds a backend device token issued after sign-in.
+  bool get isDeviceRegistered => secrets.hasBackendDeviceToken;
+
+  /// Signed in and configured for the backend, but not yet registered — the
+  /// controller will register on the next backend interaction.
+  bool get isAwaitingDeviceRegistration =>
+      isSignedIn &&
+      config.backendBaseUrl.trim().isNotEmpty &&
+      !isDeviceRegistered;
+
+  bool get hasSupabaseAuthConfig => config.hasSupabaseAuthConfig;
+
   StorageEstimate get estimate => StorageEstimate(
     bitRate: config.effectiveBitRate,
     deviceHours: config.deviceRetentionHours,

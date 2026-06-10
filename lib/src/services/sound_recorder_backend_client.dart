@@ -411,6 +411,27 @@ class SoundRecorderBackendClient {
     return _mapList(body['connections']);
   }
 
+  /// Revokes a linked cloud destination, clearing its sealed credentials and
+  /// skipping its pending copy jobs server-side.
+  Future<void> revokeCloudConnection({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required String connectionId,
+  }) async {
+    final uri = _apiUri(
+      config,
+      '/api/mobile/v1/cloud-connections/$connectionId/revoke',
+    );
+    final response = await _httpClient
+        .post(uri, headers: _jsonHeaders(secrets))
+        .timeout(requestTimeout);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(
+        _errorMessage(_decode(response), 'Revoking cloud connection failed.'),
+      );
+    }
+  }
+
   /// Begins a cloud link. Returns the parsed `oauth/start` response (state,
   /// authorizationUrl, requiredScope, ...).
   Future<Map<String, dynamic>> startCloudLink({

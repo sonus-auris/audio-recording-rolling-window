@@ -1,13 +1,14 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'src/app/app_controller.dart';
 import 'src/app/app_view_model.dart';
 import 'src/models/app_config.dart';
+import 'src/models/cloud_connection.dart';
 import 'src/models/cloud_provider.dart';
-import 'src/models/cloud_secrets.dart';
 import 'src/models/storage_estimate.dart';
 
 void main() {
@@ -151,6 +152,8 @@ class _SettingsPageState extends State<SettingsPage> {
   final _s3AccessKeyController = TextEditingController();
   final _s3SecretKeyController = TextEditingController();
   final _s3SessionTokenController = TextEditingController();
+  final _supabaseUrlController = TextEditingController();
+  final _supabaseAnonKeyController = TextEditingController();
 
   String? _syncedDeviceId;
   CloudProvider _selectedProvider = CloudProvider.s3;
@@ -175,6 +178,8 @@ class _SettingsPageState extends State<SettingsPage> {
       _s3AccessKeyController,
       _s3SecretKeyController,
       _s3SessionTokenController,
+      _supabaseUrlController,
+      _supabaseAnonKeyController,
     ]) {
       controller.dispose();
     }
@@ -269,6 +274,20 @@ class _SettingsPageState extends State<SettingsPage> {
           key: _formKey,
           child: _ConfigureView(
             viewModel: viewModel,
+            accountSection: _AccountSection(
+              isSignedIn: viewModel.isSignedIn,
+              signedInEmail: viewModel.signedInEmail,
+              isDeviceRegistered: viewModel.isDeviceRegistered,
+              isAwaitingDeviceRegistration:
+                  viewModel.isAwaitingDeviceRegistration,
+              supabaseUrlController: _supabaseUrlController,
+              supabaseAnonKeyController: _supabaseAnonKeyController,
+              onSignIn: (email, password) =>
+                  _signIn(viewModel, email, password),
+              onSignUp: (email, password) =>
+                  _signUp(viewModel, email, password),
+              onSignOut: widget.controller.signOutSupabase,
+            ),
             selectedProvider: _selectedProvider,
             uploadEnabled: _uploadEnabled,
             onUploadEnabledChanged: (value) =>
@@ -278,6 +297,7 @@ class _SettingsPageState extends State<SettingsPage> {
             onSave: () => _save(viewModel),
             onAudioConfigChanged: (updated) =>
                 widget.controller.saveConfig(updated),
+            controller: widget.controller,
             deviceRetentionController: _deviceRetentionController,
             cloudRetentionController: _cloudRetentionController,
             segmentMinutesController: _segmentMinutesController,
@@ -327,6 +347,8 @@ class _SettingsPageState extends State<SettingsPage> {
     _s3AccessKeyController.text = secrets.s3AccessKeyId;
     _s3SecretKeyController.text = secrets.s3SecretAccessKey;
     _s3SessionTokenController.text = secrets.s3SessionToken;
+    _supabaseUrlController.text = config.supabaseUrl;
+    _supabaseAnonKeyController.text = config.supabaseAnonKey;
     _selectedProvider = config.cloudProvider;
     _uploadEnabled = config.uploadEnabled;
     _syncedDeviceId = config.deviceId;
@@ -350,18 +372,53 @@ class _SettingsPageState extends State<SettingsPage> {
       s3Region: _s3RegionController.text,
       s3Prefix: _s3PrefixController.text,
       s3Endpoint: _s3EndpointController.text,
+      supabaseUrl: _supabaseUrlController.text.trim(),
+      supabaseAnonKey: _supabaseAnonKeyController.text.trim(),
     );
-    final secrets = CloudSecrets(
+    // copyWith preserves the Supabase session fields (access/refresh/expiry/
+    // email) that have no form field, so saving settings never erases identity.
+    final secrets = viewModel.secrets.copyWith(
       s3AccessKeyId: _s3AccessKeyController.text,
       s3SecretAccessKey: _s3SecretKeyController.text,
       s3SessionToken: _s3SessionTokenController.text,
       backendDeviceToken: _backendDeviceTokenController.text,
-      // Preserve the Supabase identity token, which has no form field.
-      supabaseAccessToken: viewModel.secrets.supabaseAccessToken,
     );
     await widget.controller.saveConfig(config);
     await widget.controller.saveSecrets(secrets);
     _syncedDeviceId = null;
+  }
+
+  Future<void> _persistSupabaseConfig(AppViewModel viewModel) async {
+    await widget.controller.saveConfig(
+      viewModel.config.copyWith(
+        supabaseUrl: _supabaseUrlController.text.trim(),
+        supabaseAnonKey: _supabaseAnonKeyController.text.trim(),
+      ),
+    );
+  }
+
+  Future<void> _signIn(
+    AppViewModel viewModel,
+    String email,
+    String password,
+  ) async {
+    await _persistSupabaseConfig(viewModel);
+    await widget.controller.signInWithSupabase(
+      email: email,
+      password: password,
+    );
+  }
+
+  Future<void> _signUp(
+    AppViewModel viewModel,
+    String email,
+    String password,
+  ) async {
+    await _persistSupabaseConfig(viewModel);
+    await widget.controller.signUpWithSupabase(
+      email: email,
+      password: password,
+    );
   }
 
   int _parseInt(String value, int fallback) {
@@ -389,6 +446,10 @@ class _HomeView extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
       children: [
+        if (!viewModel.isSignedIn) ...[
+          const _SignInNotice(),
+          const SizedBox(height: 12),
+        ],
         _StatusSection(
           viewModel: viewModel,
           onStart: onStart,
@@ -700,12 +761,14 @@ class _PlaybackViewState extends State<_PlaybackView> {
 class _ConfigureView extends StatelessWidget {
   const _ConfigureView({
     required this.viewModel,
+    required this.accountSection,
     required this.selectedProvider,
     required this.uploadEnabled,
     required this.onUploadEnabledChanged,
     required this.onProviderChanged,
     required this.onSave,
     required this.onAudioConfigChanged,
+    required this.controller,
     required this.deviceRetentionController,
     required this.cloudRetentionController,
     required this.segmentMinutesController,
@@ -724,12 +787,14 @@ class _ConfigureView extends StatelessWidget {
   });
 
   final AppViewModel viewModel;
+  final Widget accountSection;
   final CloudProvider selectedProvider;
   final bool uploadEnabled;
   final ValueChanged<bool> onUploadEnabledChanged;
   final ValueChanged<CloudProvider> onProviderChanged;
   final VoidCallback onSave;
   final ValueChanged<AppConfig> onAudioConfigChanged;
+  final AppController controller;
   final TextEditingController deviceRetentionController;
   final TextEditingController cloudRetentionController;
   final TextEditingController segmentMinutesController;
@@ -751,6 +816,8 @@ class _ConfigureView extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
       children: [
+        accountSection,
+        const SizedBox(height: 16),
         LayoutBuilder(
           builder: (context, constraints) {
             final wide = constraints.maxWidth >= 840;
@@ -804,6 +871,10 @@ class _ConfigureView extends StatelessWidget {
           config: viewModel.config,
           onChanged: onAudioConfigChanged,
         ),
+        if (viewModel.isDeviceRegistered) ...[
+          const SizedBox(height: 16),
+          _CloudLinkSection(controller: controller, viewModel: viewModel),
+        ],
         const SizedBox(height: 16),
         FilledButton.icon(
           onPressed: onSave,
@@ -811,6 +882,181 @@ class _ConfigureView extends StatelessWidget {
           label: const Text('Save Configuration'),
         ),
       ],
+    );
+  }
+}
+
+/// Supabase identity: project config plus email/password sign-in. When signed
+/// in, the controller registers the device and uploads run under the verified
+/// account. The password is held only transiently in a local field.
+class _AccountSection extends StatefulWidget {
+  const _AccountSection({
+    required this.isSignedIn,
+    required this.signedInEmail,
+    required this.isDeviceRegistered,
+    required this.isAwaitingDeviceRegistration,
+    required this.supabaseUrlController,
+    required this.supabaseAnonKeyController,
+    required this.onSignIn,
+    required this.onSignUp,
+    required this.onSignOut,
+  });
+
+  final bool isSignedIn;
+  final String? signedInEmail;
+  final bool isDeviceRegistered;
+  final bool isAwaitingDeviceRegistration;
+  final TextEditingController supabaseUrlController;
+  final TextEditingController supabaseAnonKeyController;
+  final Future<void> Function(String email, String password) onSignIn;
+  final Future<void> Function(String email, String password) onSignUp;
+  final VoidCallback onSignOut;
+
+  @override
+  State<_AccountSection> createState() => _AccountSectionState();
+}
+
+class _AccountSectionState extends State<_AccountSection> {
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _run(
+    Future<void> Function(String, String) action,
+  ) async {
+    if (_busy) {
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await action(_emailController.text.trim(), _passwordController.text);
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    if (widget.isSignedIn) {
+      final status = widget.isDeviceRegistered
+          ? 'Device registered.'
+          : widget.isAwaitingDeviceRegistration
+          ? 'Registering device…'
+          : 'Set the backend URL to register this device.';
+      return _Section(
+        title: 'Account',
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.verified_user, size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    widget.signedInEmail ?? 'Signed in',
+                    style: theme.textTheme.titleSmall,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(status, style: theme.textTheme.bodySmall),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: widget.onSignOut,
+              icon: const Icon(Icons.logout),
+              label: const Text('Sign out'),
+            ),
+          ],
+        ),
+      );
+    }
+    return _Section(
+      title: 'Account',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Sign in with Supabase to record under your account and back up to cloud storage.',
+            style: theme.textTheme.bodySmall,
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: widget.supabaseUrlController,
+            decoration: const InputDecoration(
+              labelText: 'Supabase URL',
+              hintText: 'https://YOUR-PROJECT.supabase.co',
+            ),
+            autocorrect: false,
+            enableSuggestions: false,
+            keyboardType: TextInputType.url,
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: widget.supabaseAnonKeyController,
+            decoration: const InputDecoration(
+              labelText: 'Supabase anon key',
+            ),
+            obscureText: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            keyboardType: TextInputType.visiblePassword,
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _emailController,
+            decoration: const InputDecoration(labelText: 'Email'),
+            autocorrect: false,
+            enableSuggestions: false,
+            keyboardType: TextInputType.emailAddress,
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _passwordController,
+            decoration: const InputDecoration(labelText: 'Password'),
+            obscureText: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            onSubmitted: (_) => _run(widget.onSignIn),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _busy ? null : () => _run(widget.onSignIn),
+                  icon: _busy
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.login),
+                  label: const Text('Sign in'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: _busy ? null : () => _run(widget.onSignUp),
+                  child: const Text('Create account'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1026,6 +1272,297 @@ class _AudioTuningSectionState extends State<_AudioTuningSection> {
           ),
         ],
       ),
+    );
+  }
+}
+
+String _cloudProviderLabel(String provider) {
+  switch (provider) {
+    case 'google_drive':
+      return 'Google Drive';
+    case 'microsoft_onedrive':
+      return 'Microsoft OneDrive';
+    case 'apple_icloud':
+      return 'Apple iCloud';
+    default:
+      return provider;
+  }
+}
+
+/// Lists linked cloud destinations and offers one-tap iCloud linking plus a
+/// guided authorization-code flow for Google Drive / OneDrive.
+class _CloudLinkSection extends StatefulWidget {
+  const _CloudLinkSection({required this.controller, required this.viewModel});
+
+  final AppController controller;
+  final AppViewModel viewModel;
+
+  @override
+  State<_CloudLinkSection> createState() => _CloudLinkSectionState();
+}
+
+class _CloudLinkSectionState extends State<_CloudLinkSection> {
+  Future<List<CloudConnection>>? _future;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  void _refresh() {
+    setState(() => _future = widget.controller.loadCloudConnections());
+  }
+
+  Future<void> _run(Future<void> Function() action) async {
+    setState(() => _busy = true);
+    try {
+      await action();
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+        _refresh();
+      }
+    }
+  }
+
+  Future<void> _linkProvider(CloudProvider provider) async {
+    final host = Uri.tryParse(widget.viewModel.config.backendBaseUrl.trim());
+    final defaultRedirect = (host != null && host.host.isNotEmpty)
+        ? '${host.scheme}://${host.host}/oauth/callback'
+        : '';
+    await showDialog<bool>(
+      context: context,
+      builder: (_) => _ProviderLinkDialog(
+        provider: provider,
+        controller: widget.controller,
+        defaultRedirectUri: defaultRedirect,
+      ),
+    );
+    if (mounted) {
+      _refresh();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _Section(
+      title: 'Cloud Backup Links',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Mirror uploaded recordings to your own cloud storage.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 12),
+          FutureBuilder<List<CloudConnection>>(
+            future: _future,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 8),
+                  child: LinearProgressIndicator(),
+                );
+              }
+              if (snapshot.hasError) {
+                return Text('Could not load links: ${snapshot.error}');
+              }
+              final connections = snapshot.data ?? const <CloudConnection>[];
+              if (connections.isEmpty) {
+                return const Text('No cloud destinations linked yet.');
+              }
+              return Column(
+                children: [for (final c in connections) _tile(c)],
+              );
+            },
+          ),
+          const Divider(height: 24),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                onPressed: _busy ? null : () => _run(widget.controller.linkICloud),
+                icon: const Icon(Icons.cloud_outlined),
+                label: const Text('Link iCloud'),
+              ),
+              OutlinedButton.icon(
+                onPressed:
+                    _busy ? null : () => _linkProvider(CloudProvider.googleDrive),
+                icon: const Icon(Icons.add_to_drive_outlined),
+                label: const Text('Link Google Drive'),
+              ),
+              OutlinedButton.icon(
+                onPressed:
+                    _busy ? null : () => _linkProvider(CloudProvider.oneDrive),
+                icon: const Icon(Icons.cloud_sync_outlined),
+                label: const Text('Link OneDrive'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: _busy
+                  ? null
+                  : () => _run(widget.controller.syncIcloudBackups),
+              icon: const Icon(Icons.sync),
+              label: const Text('Sync iCloud now'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tile(CloudConnection connection) {
+    final detail = [
+      connection.status,
+      connection.folderPath,
+      if (connection.displayName != null) connection.displayName!,
+    ].where((part) => part.trim().isNotEmpty).join(' · ');
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      title: Text(_cloudProviderLabel(connection.provider)),
+      subtitle: Text(detail),
+      trailing: IconButton(
+        icon: const Icon(Icons.link_off),
+        tooltip: 'Remove',
+        onPressed: _busy
+            ? null
+            : () => _run(
+                  () => widget.controller.revokeCloudConnection(connection.id),
+                ),
+      ),
+    );
+  }
+}
+
+/// Guided Google Drive / OneDrive link: fetch an authorization URL, let the user
+/// authorize in a browser, then paste the returned `code` back to complete.
+class _ProviderLinkDialog extends StatefulWidget {
+  const _ProviderLinkDialog({
+    required this.provider,
+    required this.controller,
+    required this.defaultRedirectUri,
+  });
+
+  final CloudProvider provider;
+  final AppController controller;
+  final String defaultRedirectUri;
+
+  @override
+  State<_ProviderLinkDialog> createState() => _ProviderLinkDialogState();
+}
+
+class _ProviderLinkDialogState extends State<_ProviderLinkDialog> {
+  late final TextEditingController _redirect =
+      TextEditingController(text: widget.defaultRedirectUri);
+  final TextEditingController _code = TextEditingController();
+  CloudLinkStart? _start;
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _redirect.dispose();
+    _code.dispose();
+    super.dispose();
+  }
+
+  Future<void> _getLink() async {
+    setState(() => _busy = true);
+    final start = await widget.controller.startProviderLink(
+      widget.provider,
+      redirectUri: _redirect.text.trim(),
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _busy = false;
+      _start = start;
+    });
+  }
+
+  Future<void> _complete() async {
+    final start = _start;
+    if (start == null) {
+      return;
+    }
+    setState(() => _busy = true);
+    final ok = await widget.controller.completeProviderLink(
+      provider: widget.provider,
+      state: start.state,
+      authorizationCode: _code.text.trim(),
+      redirectUri: _redirect.text.trim(),
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() => _busy = false);
+    if (ok) {
+      Navigator.of(context).pop(true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final start = _start;
+    final authUrl = start?.authorizationUrl;
+    return AlertDialog(
+      title: Text('Link ${widget.provider.label}'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _redirect,
+              decoration: const InputDecoration(
+                labelText: 'Redirect URI',
+                helperText: 'Must match the OAuth client registered on the server.',
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (authUrl == null)
+              FilledButton(
+                onPressed: _busy ? null : _getLink,
+                child: const Text('Get authorization link'),
+              )
+            else ...[
+              const Text('1. Open this link and authorize:'),
+              const SizedBox(height: 4),
+              SelectableText(authUrl),
+              const SizedBox(height: 4),
+              TextButton.icon(
+                onPressed: () => Clipboard.setData(ClipboardData(text: authUrl)),
+                icon: const Icon(Icons.copy, size: 18),
+                label: const Text('Copy link'),
+              ),
+              const SizedBox(height: 8),
+              const Text('2. Paste the authorization code from the redirect:'),
+              TextField(
+                controller: _code,
+                decoration: const InputDecoration(labelText: 'Authorization code'),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.of(context).pop(false),
+          child: const Text('Cancel'),
+        ),
+        if (authUrl != null)
+          FilledButton(
+            onPressed: _busy ? null : _complete,
+            child: const Text('Complete link'),
+          ),
+      ],
     );
   }
 }
@@ -1661,6 +2198,36 @@ class _Section extends StatelessWidget {
             child,
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _SignInNotice extends StatelessWidget {
+  const _SignInNotice();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.secondaryContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.account_circle, color: theme.colorScheme.onSecondaryContainer),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Not signed in. Open the Configure tab to sign in with Supabase and back up recordings to your account.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSecondaryContainer,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
