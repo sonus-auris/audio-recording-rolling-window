@@ -12,10 +12,12 @@ import '../models/recorder_snapshot.dart';
 import '../models/cloud_connection.dart';
 import '../models/recording_segment.dart';
 import '../models/supabase_session.dart';
+import '../models/transfer_gate_status.dart';
 import '../services/background_capture_service.dart';
 import '../services/icloud_sync_service.dart';
 import '../services/diagnostic_log.dart';
 import '../services/playback_service.dart';
+import '../services/power_network_gate.dart';
 import '../services/recording_feedback.dart';
 import '../services/s3_storage_client.dart';
 import '../services/segment_index.dart';
@@ -42,6 +44,7 @@ class AppController {
     IcloudSyncService? icloudSyncService,
     DiagnosticLog? diagnosticLog,
     RecordingFeedback? feedback,
+    PowerNetworkGate? powerNetworkGate,
   }) {
     final effectiveSegmentIndex = segmentIndex ?? SegmentIndex();
     final effectiveDiagnostics = diagnosticLog ?? DiagnosticLog();
@@ -60,6 +63,7 @@ class AppController {
       icloudSyncService: icloudSyncService ?? IcloudSyncService(),
       diagnostics: effectiveDiagnostics,
       feedback: feedback ?? RecordingFeedback(),
+      powerNetworkGate: powerNetworkGate ?? PowerNetworkGate(),
     );
   }
 
@@ -75,7 +79,21 @@ class AppController {
     required this._icloudSyncService,
     required this._diagnostics,
     required this._feedback,
+    required this._powerNetworkGate,
   }) {
+    // Pre-combine the upload flag and transfer-gate status into one record so
+    // both ride a single slot of the (max-arity-9) combineLatest below.
+    final uploadStatus =
+        Rx.combineLatest2<
+          bool,
+          TransferGateStatus,
+          ({bool isUploading, TransferGateStatus transfer})
+        >(
+          _isUploading,
+          _transfer,
+          (isUploading, transfer) =>
+              (isUploading: isUploading, transfer: transfer),
+        );
     _viewModels =
         Rx.combineLatest9<
               AppConfig,
@@ -85,7 +103,7 @@ class AppController {
               PlaybackSnapshot,
               List<String>,
               bool,
-              bool,
+              ({bool isUploading, TransferGateStatus transfer}),
               String?,
               AppViewModel
             >(
@@ -96,7 +114,7 @@ class AppController {
               _playback.snapshots,
               _diagnostics.entries,
               _isInitializing,
-              _isUploading,
+              uploadStatus,
               _message,
               (
                 config,
@@ -106,7 +124,7 @@ class AppController {
                 playback,
                 diagnosticEntries,
                 isInitializing,
-                isUploading,
+                uploadState,
                 message,
               ) {
                 return AppViewModel(
@@ -117,7 +135,8 @@ class AppController {
                   playback: playback,
                   diagnosticEntries: diagnosticEntries,
                   isInitializing: isInitializing,
-                  isUploading: isUploading,
+                  isUploading: uploadState.isUploading,
+                  transferStatus: uploadState.transfer,
                   message: message,
                 );
               },
@@ -136,9 +155,18 @@ class AppController {
   final IcloudSyncService _icloudSyncService;
   final DiagnosticLog _diagnostics;
   final RecordingFeedback _feedback;
+  final PowerNetworkGate _powerNetworkGate;
   Future<void>? _deviceRegistrationInFlight;
   Future<void>? _supabaseRefreshInFlight;
   Future<void>? _icloudSyncInFlight;
+  StreamSubscription<void>? _transferConditionsSubscription;
+  String? _lastReportedTransferSignature;
+  DateTime? _lastTransferReportAt;
+
+  /// While paused, the device re-affirms its state to the backend at least this
+  /// often so the server-side pause lease (which the cloud-copy drain honors)
+  /// stays fresh. Must be comfortably shorter than the backend lease window.
+  static const Duration _transferReaffirmInterval = Duration(minutes: 5);
 
   final BehaviorSubject<AppConfig> _config = BehaviorSubject();
   final BehaviorSubject<CloudSecrets> _secrets = BehaviorSubject();
@@ -146,6 +174,8 @@ class AppController {
       BehaviorSubject.seeded(const []);
   final BehaviorSubject<bool> _isInitializing = BehaviorSubject.seeded(true);
   final BehaviorSubject<bool> _isUploading = BehaviorSubject.seeded(false);
+  final BehaviorSubject<TransferGateStatus> _transfer =
+      BehaviorSubject.seeded(const TransferGateStatus.unknown());
   final BehaviorSubject<String?> _message = BehaviorSubject.seeded(null);
   final PublishSubject<void> _uploadRequests = PublishSubject();
 
@@ -201,11 +231,90 @@ class AppController {
             _isUploading.add(false);
           },
         );
+    // React to battery / connectivity changes: re-trigger the upload queue so
+    // deferred segments catch up the moment conditions allow it again, and keep
+    // the surfaced status fresh.
+    _transferConditionsSubscription = _powerNetworkGate.changes.listen(
+      (_) => unawaited(_onTransferConditionsChanged()),
+      onError: (Object error) {
+        _diagnostics.add('Transfer condition watch failed: $error');
+      },
+    );
+    await _refreshTransferStatus();
     _isInitializing.add(false);
     _diagnostics.add('App controller init completed.');
     await _ensureSupabaseReady();
     requestUploadDrain();
     await _enforceRetention();
+  }
+
+  Future<void> _onTransferConditionsChanged() async {
+    final status = await _refreshTransferStatus();
+    if (status.allowed) {
+      // Conditions recovered — drain pending uploads and mirror to iCloud.
+      requestUploadDrain();
+      unawaited(syncIcloudBackups());
+    }
+  }
+
+  /// Evaluates the current power/network gate against config, publishes the
+  /// status for the UI, and reports transitions to the backend so server-managed
+  /// copies stay consistent with the device's intent. Returns the status.
+  Future<TransferGateStatus> _refreshTransferStatus() async {
+    final config = _config.valueOrNull;
+    if (config == null) {
+      return _transfer.value;
+    }
+    final status = await _powerNetworkGate.evaluate(config);
+    if (!_transfer.isClosed) {
+      _transfer.add(status);
+    }
+    unawaited(_reportTransferState(config, status));
+    return status;
+  }
+
+  /// Tells the backend whether this device is currently pausing transfers and
+  /// why, so server-managed (Google Drive / OneDrive) copies are held while the
+  /// device defers and resume together. De-duplicated to transitions only.
+  Future<void> _reportTransferState(
+    AppConfig config,
+    TransferGateStatus status,
+  ) async {
+    final secrets = _secrets.valueOrNull;
+    if (secrets == null || !_backendClient.canUseBackend(config, secrets)) {
+      return;
+    }
+    final signature =
+        '${status.isPaused}|${status.wireReason ?? ''}|'
+        '${config.uploadNetworkPolicy.wireName}';
+    final now = DateTime.now();
+    final lastAt = _lastTransferReportAt;
+    // Re-affirm a still-active pause periodically so the backend lease stays
+    // fresh even when the gate decision itself hasn't changed.
+    final needsReaffirm =
+        status.isPaused &&
+        (lastAt == null ||
+            now.difference(lastAt) >= _transferReaffirmInterval);
+    if (signature == _lastReportedTransferSignature && !needsReaffirm) {
+      return;
+    }
+    _lastReportedTransferSignature = signature;
+    _lastTransferReportAt = now;
+    final error = await _backendClient.reportTransferState(
+      config: config,
+      secrets: secrets,
+      paused: status.isPaused,
+      reason: status.wireReason,
+      networkPolicy: config.uploadNetworkPolicy.wireName,
+      batteryLevel: status.batteryLevel >= 0 ? status.batteryLevel : null,
+      charging: status.isCharging,
+    );
+    if (error != null) {
+      // Don't strand future reports on a transient failure.
+      _lastReportedTransferSignature = null;
+      _lastTransferReportAt = null;
+      _diagnostics.add('Transfer-state report failed: $error');
+    }
   }
 
   Future<void> saveConfig(AppConfig config) async {
@@ -236,6 +345,10 @@ class AppController {
       bassGainDb: config.bassGainDb.clamp(-12.0, 12.0),
       midGainDb: config.midGainDb.clamp(-12.0, 12.0),
       trebleGainDb: config.trebleGainDb.clamp(-12.0, 12.0),
+      lowBatteryThresholdPercent: config.lowBatteryThresholdPercent.clamp(
+        1,
+        100,
+      ),
     );
     if (_backendSessionKey != _sessionKey(normalized, _secrets.valueOrNull)) {
       _backendSession = null;
@@ -245,6 +358,9 @@ class AppController {
     await _settingsStore.saveConfig(normalized);
     _config.add(normalized);
     _message.add('Settings saved.');
+    // Battery-saver / network-policy may have changed; re-evaluate the gate (and
+    // report the new policy to the backend) before draining.
+    await _refreshTransferStatus();
     requestUploadDrain();
     await _enforceRetention();
   }
@@ -845,6 +961,13 @@ class AppController {
         !_secrets.value.hasBackendDeviceToken) {
       return;
     }
+    // iCloud mirroring downloads each segment and writes it into the user's
+    // iCloud container — a device-originated transfer, so honor the same gate.
+    final gate = await _refreshTransferStatus();
+    if (!gate.allowed) {
+      _diagnostics.add('iCloud mirroring deferred: ${gate.detail ?? 'gated'}');
+      return;
+    }
     await _ensureFreshSupabaseToken();
     final result = await _icloudSyncService.syncPendingJobs(
       backendClient: _backendClient,
@@ -877,6 +1000,7 @@ class AppController {
     await _closedSegmentsSubscription?.cancel();
     await _triggerSubscription?.cancel();
     await _uploadSubscription?.cancel();
+    await _transferConditionsSubscription?.cancel();
     await _uploadRequests.close();
     await _recorder.dispose();
     await _playback.dispose();
@@ -891,6 +1015,7 @@ class AppController {
     await _segments.close();
     await _isInitializing.close();
     await _isUploading.close();
+    await _transfer.close();
     await _message.close();
   }
 
@@ -910,6 +1035,14 @@ class AppController {
       return;
     }
     if (!_config.value.uploadEnabled) {
+      return;
+    }
+    // Power / network gate. Recording (the rolling local window) is untouched;
+    // this only defers cloud streaming, so segments stay on device and catch up
+    // once the battery recovers or an allowed network is available.
+    final gate = await _refreshTransferStatus();
+    if (!gate.allowed) {
+      _diagnostics.add('Uploads deferred: ${gate.detail ?? 'gated'}');
       return;
     }
     // Refresh identity / registration before reading secrets so the upload runs

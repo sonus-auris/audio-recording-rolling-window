@@ -1,4 +1,5 @@
 import 'cloud_provider.dart';
+import 'upload_network_policy.dart';
 
 class AppConfig {
   const AppConfig({
@@ -28,6 +29,9 @@ class AppConfig {
     this.autoGain = true,
     this.noiseSuppress = true,
     this.verbalCuesEnabled = false,
+    this.pauseUploadsOnLowBattery = true,
+    this.lowBatteryThresholdPercent = 20,
+    this.uploadNetworkPolicy = UploadNetworkPolicy.any,
   });
 
   /// Capture intents understood by both the app and the backend. Music turns off
@@ -87,6 +91,19 @@ class AppConfig {
 
   /// Speak short confirmations ("recording", "saved") while capturing.
   final bool verbalCuesEnabled;
+
+  /// When true, pause cloud uploads while the battery is below
+  /// [lowBatteryThresholdPercent] and the device is not charging. Local capture
+  /// of the rolling window is never affected — deferred segments stay on device
+  /// and upload catches up once the battery recovers (or charging starts).
+  final bool pauseUploadsOnLowBattery;
+
+  /// Battery percentage (1..100) under which uploads are paused when
+  /// [pauseUploadsOnLowBattery] is on.
+  final int lowBatteryThresholdPercent;
+
+  /// Which network transports uploads may use. Local capture is unaffected.
+  final UploadNetworkPolicy uploadNetworkPolicy;
 
   bool get isMusic => useCase == 'music';
 
@@ -159,6 +176,9 @@ class AppConfig {
     bool? autoGain,
     bool? noiseSuppress,
     bool? verbalCuesEnabled,
+    bool? pauseUploadsOnLowBattery,
+    int? lowBatteryThresholdPercent,
+    UploadNetworkPolicy? uploadNetworkPolicy,
   }) {
     return AppConfig(
       deviceId: deviceId ?? this.deviceId,
@@ -188,6 +208,11 @@ class AppConfig {
       autoGain: autoGain ?? this.autoGain,
       noiseSuppress: noiseSuppress ?? this.noiseSuppress,
       verbalCuesEnabled: verbalCuesEnabled ?? this.verbalCuesEnabled,
+      pauseUploadsOnLowBattery:
+          pauseUploadsOnLowBattery ?? this.pauseUploadsOnLowBattery,
+      lowBatteryThresholdPercent:
+          lowBatteryThresholdPercent ?? this.lowBatteryThresholdPercent,
+      uploadNetworkPolicy: uploadNetworkPolicy ?? this.uploadNetworkPolicy,
     );
   }
 
@@ -219,6 +244,9 @@ class AppConfig {
       'autoGain': autoGain,
       'noiseSuppress': noiseSuppress,
       'verbalCuesEnabled': verbalCuesEnabled,
+      'pauseUploadsOnLowBattery': pauseUploadsOnLowBattery,
+      'lowBatteryThresholdPercent': lowBatteryThresholdPercent,
+      'uploadNetworkPolicy': uploadNetworkPolicy.wireName,
     };
   }
 
@@ -254,6 +282,15 @@ class AppConfig {
       autoGain: json['autoGain'] as bool? ?? true,
       noiseSuppress: json['noiseSuppress'] as bool? ?? true,
       verbalCuesEnabled: json['verbalCuesEnabled'] as bool? ?? false,
+      pauseUploadsOnLowBattery:
+          json['pauseUploadsOnLowBattery'] as bool? ?? true,
+      lowBatteryThresholdPercent: _asInt(
+        json['lowBatteryThresholdPercent'],
+        20,
+      ).clamp(1, 100),
+      uploadNetworkPolicy: UploadNetworkPolicy.fromName(
+        json['uploadNetworkPolicy'] as String?,
+      ),
     );
   }
 

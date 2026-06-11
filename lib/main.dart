@@ -10,6 +10,8 @@ import 'src/models/app_config.dart';
 import 'src/models/cloud_connection.dart';
 import 'src/models/cloud_provider.dart';
 import 'src/models/storage_estimate.dart';
+import 'src/models/transfer_gate_status.dart';
+import 'src/models/upload_network_policy.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -456,6 +458,22 @@ class _HomeView extends StatelessWidget {
           onStop: onStop,
           onSendAlert: onSendAlert,
         ),
+        if (viewModel.isUploadGatePaused) ...[
+          const SizedBox(height: 12),
+          Card(
+            color: Theme.of(context).colorScheme.errorContainer,
+            child: ListTile(
+              leading: const Icon(Icons.cloud_off),
+              title: Text(
+                '${viewModel.pendingUploads} segment(s) waiting to upload',
+              ),
+              subtitle: Text(
+                viewModel.transferStatus.detail ??
+                    'Uploads are paused. Recording continues on device.',
+              ),
+            ),
+          ),
+        ],
         const SizedBox(height: 12),
         OutlinedButton.icon(
           onPressed: onConfirm,
@@ -867,6 +885,12 @@ class _ConfigureView extends StatelessWidget {
           },
         ),
         const SizedBox(height: 16),
+        _TransferPolicySection(
+          config: viewModel.config,
+          status: viewModel.transferStatus,
+          onChanged: onAudioConfigChanged,
+        ),
+        const SizedBox(height: 16),
         _AudioTuningSection(
           config: viewModel.config,
           onChanged: onAudioConfigChanged,
@@ -1057,6 +1081,167 @@ class _AccountSectionState extends State<_AccountSection> {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Battery + network controls for cloud streaming. These never affect local
+/// capture (the rolling 50h+ window keeps recording); they only defer uploads,
+/// which catch up automatically once conditions allow. Changes persist
+/// immediately via [onChanged]; [status] reflects the live gate decision.
+class _TransferPolicySection extends StatefulWidget {
+  const _TransferPolicySection({
+    required this.config,
+    required this.status,
+    required this.onChanged,
+  });
+
+  final AppConfig config;
+  final TransferGateStatus status;
+  final ValueChanged<AppConfig> onChanged;
+
+  @override
+  State<_TransferPolicySection> createState() => _TransferPolicySectionState();
+}
+
+class _TransferPolicySectionState extends State<_TransferPolicySection> {
+  String? _syncedDeviceId;
+  late bool _pauseOnLowBattery;
+  late double _threshold;
+  late UploadNetworkPolicy _networkPolicy;
+
+  void _seed(AppConfig config) {
+    _pauseOnLowBattery = config.pauseUploadsOnLowBattery;
+    _threshold = config.lowBatteryThresholdPercent.clamp(5, 80).toDouble();
+    _networkPolicy = config.uploadNetworkPolicy;
+    _syncedDeviceId = config.deviceId;
+  }
+
+  void _apply() {
+    widget.onChanged(
+      widget.config.copyWith(
+        pauseUploadsOnLowBattery: _pauseOnLowBattery,
+        lowBatteryThresholdPercent: _threshold.round(),
+        uploadNetworkPolicy: _networkPolicy,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_syncedDeviceId != widget.config.deviceId) {
+      _seed(widget.config);
+    }
+    final status = widget.status;
+    return _Section(
+      title: 'Battery & Network',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Local recording always continues. These settings only pause cloud '
+            'uploads, which catch up automatically once the battery recovers or '
+            'an allowed network is available.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _pauseOnLowBattery,
+            onChanged: (value) {
+              setState(() => _pauseOnLowBattery = value);
+              _apply();
+            },
+            title: const Text('Pause uploads on low battery'),
+            subtitle: const Text(
+              'Uploads stop below the threshold (unless charging).',
+            ),
+          ),
+          if (_pauseOnLowBattery)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Low-battery threshold: ${_threshold.round()}%'),
+                  Slider(
+                    value: _threshold,
+                    min: 5,
+                    max: 80,
+                    divisions: 15,
+                    label: '${_threshold.round()}%',
+                    onChanged: (v) => setState(() => _threshold = v),
+                    onChangeEnd: (_) => _apply(),
+                  ),
+                ],
+              ),
+            ),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<UploadNetworkPolicy>(
+            initialValue: _networkPolicy,
+            decoration: const InputDecoration(labelText: 'Upload over'),
+            items: UploadNetworkPolicy.values
+                .map(
+                  (policy) => DropdownMenuItem(
+                    value: policy,
+                    child: Text(policy.label),
+                  ),
+                )
+                .toList(),
+            onChanged: (value) {
+              if (value == null) {
+                return;
+              }
+              setState(() => _networkPolicy = value);
+              _apply();
+            },
+          ),
+          const SizedBox(height: 8),
+          _TransferStatusLine(status: status),
+        ],
+      ),
+    );
+  }
+}
+
+/// One-line live readout of the current gate: battery, network, and whether
+/// uploads are paused (with the reason).
+class _TransferStatusLine extends StatelessWidget {
+  const _TransferStatusLine({required this.status});
+
+  final TransferGateStatus status;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final battery = status.batteryLevel >= 0
+        ? '${status.batteryLevel}%${status.isCharging ? ' (charging)' : ''}'
+        : 'unknown';
+    final network = !status.isOnline
+        ? 'offline'
+        : status.onWifi
+        ? 'Wi-Fi'
+        : status.onCellular
+        ? 'cellular'
+        : 'connected';
+    final paused = status.isPaused;
+    return Row(
+      children: [
+        Icon(
+          paused ? Icons.cloud_off : Icons.cloud_done,
+          size: 18,
+          color: paused ? theme.colorScheme.error : theme.colorScheme.primary,
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            paused
+                ? 'Uploads paused — ${status.detail ?? 'gated'} · battery $battery · $network'
+                : 'Uploads allowed · battery $battery · $network',
+            style: theme.textTheme.bodySmall,
+          ),
+        ),
+      ],
     );
   }
 }

@@ -396,6 +396,44 @@ class SoundRecorderBackendClient {
     );
   }
 
+  /// Reports the device's current transfer gate to the backend so server-managed
+  /// (Google Drive / OneDrive) copies are held while the device defers cloud
+  /// streaming for low battery or a network-policy constraint, and resume when
+  /// the device reports it is no longer paused. Returns null on success, or a
+  /// short error string. Best-effort: callers treat failures as non-fatal.
+  Future<String?> reportTransferState({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required bool paused,
+    required String? reason,
+    required String networkPolicy,
+    int? batteryLevel,
+    bool? charging,
+  }) async {
+    try {
+      final uri = _apiUri(config, '/api/mobile/v1/devices/transfer-state');
+      final response = await _httpClient
+          .post(
+            uri,
+            headers: _jsonHeaders(secrets),
+            body: jsonEncode({
+              'paused': paused,
+              if (reason != null) 'reason': reason,
+              'networkPolicy': networkPolicy,
+              if (batteryLevel != null) 'batteryLevel': batteryLevel,
+              if (charging != null) 'charging': charging,
+            }),
+          )
+          .timeout(requestTimeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return null;
+      }
+      return _errorMessage(_decode(response), 'Transfer-state report failed.');
+    } catch (error) {
+      return 'Transfer-state report failed: $error';
+    }
+  }
+
   Future<List<Map<String, dynamic>>> listCloudConnections({
     required AppConfig config,
     required CloudSecrets secrets,

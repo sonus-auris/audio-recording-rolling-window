@@ -49,6 +49,8 @@ dependencies:
   audio_session: ^0.2.3
   flutter_tts: ^4.2.0
   flutter_foreground_task: ^9.2.2
+  battery_plus: ^6.2.1
+  connectivity_plus: ^6.1.0
 
 dev_dependencies:
   flutter_test:

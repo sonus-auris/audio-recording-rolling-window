@@ -5,6 +5,7 @@ import '../models/playback_snapshot.dart';
 import '../models/recorder_snapshot.dart';
 import '../models/recording_segment.dart';
 import '../models/storage_estimate.dart';
+import '../models/transfer_gate_status.dart';
 
 class AppViewModel {
   const AppViewModel({
@@ -16,6 +17,7 @@ class AppViewModel {
     required this.diagnosticEntries,
     required this.isInitializing,
     required this.isUploading,
+    this.transferStatus = const TransferGateStatus.unknown(),
     this.message,
   });
 
@@ -27,7 +29,16 @@ class AppViewModel {
   final List<String> diagnosticEntries;
   final bool isInitializing;
   final bool isUploading;
+
+  /// Current power/network gate decision. When [TransferGateStatus.isPaused] is
+  /// true, cloud uploads are deferred (local capture continues).
+  final TransferGateStatus transferStatus;
   final String? message;
+
+  /// True when uploads are configured but currently held back by the battery /
+  /// network gate (as opposed to simply having nothing to upload).
+  bool get isUploadGatePaused =>
+      config.uploadEnabled && transferStatus.isPaused && pendingUploads > 0;
 
   /// Whether a Supabase session (access or refresh token) is held.
   bool get isSignedIn => secrets.hasSupabaseSession;
