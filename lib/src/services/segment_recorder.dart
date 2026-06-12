@@ -7,10 +7,14 @@ import 'package:record/record.dart';
 import 'package:rxdart/rxdart.dart';
 import 'package:uuid/uuid.dart';
 
+import '../models/acoustic_detection.dart';
 import '../models/audio_trigger_event.dart';
 import '../models/app_config.dart';
 import '../models/recorder_snapshot.dart';
 import '../models/recording_segment.dart';
+import 'acoustic/acoustic_pipeline.dart';
+import 'acoustic/spectral_features.dart';
+import 'acoustic_analyzer.dart';
 import 'segment_index.dart';
 import 'wav_segment_writer.dart';
 
@@ -18,13 +22,20 @@ class SegmentRecorder {
   SegmentRecorder({
     AudioRecorder? recorder,
     required SegmentIndex segmentIndex,
+    AcousticAnalyzer? analyzer,
     Uuid? uuid,
-  }) : this._(recorder ?? AudioRecorder(), segmentIndex, uuid ?? const Uuid());
+  }) : this._(
+          recorder ?? AudioRecorder(),
+          segmentIndex,
+          analyzer ?? AcousticAnalyzer(),
+          uuid ?? const Uuid(),
+        );
 
-  SegmentRecorder._(this._recorder, this._segmentIndex, this._uuid);
+  SegmentRecorder._(this._recorder, this._segmentIndex, this._analyzer, this._uuid);
 
   final AudioRecorder _recorder;
   final SegmentIndex _segmentIndex;
+  final AcousticAnalyzer _analyzer;
   final Uuid _uuid;
   final BehaviorSubject<RecorderSnapshot> _snapshot = BehaviorSubject.seeded(
     const RecorderSnapshot.idle(),
@@ -54,13 +65,70 @@ class SegmentRecorder {
   bool _stopping = false;
   _AudioDsp? _dsp;
 
+  // Capture-rate geometry. The mic may run faster than [AppConfig.sampleRate]
+  // when adaptive quality is on, so all segmentation math uses these.
+  int _captureRate = 16000;
+  int _samplesPerSegment = 16000 * 60;
+  int _overlapSamples = 0;
+
+  // Acoustic-analysis loudness gate ("kick in once decibels are sustained").
+  bool _analysisActive = false;
+  bool _gateOpen = false;
+  int _gateLoudSamples = 0;
+  int _gateQuietSamples = 0;
+  int _gateSustainSamples = 0;
+  int _gateHoldSamples = 0;
+  double _gateActivationDb = -40;
+  int _analyzerDecimFactor = 1;
+  _MonoDownsampler? _analyzerDownsampler;
+
+  // Adaptive quality: the rate the *current* segment is being stored at, and the
+  // decimator (null when storing at full capture rate).
+  int _storeRate = 16000;
+  int _storeFactor = 1;
+  _Pcm16Downsampler? _storeDownsampler;
+  int _storedOverlapSamples = 0;
+  double? _recentDb; // EMA of slice loudness, drives the per-segment decision.
+
+  // Rolling buffer of recently captured (processed) audio for Shazam / STT.
+  final List<Uint8List> _recentChunks = [];
+  int _recentBytes = 0;
+  static const double _recentWindowSeconds = 8;
+
   ValueStream<RecorderSnapshot> get snapshots => _snapshot.stream;
 
   Stream<RecordingSegment> get closedSegments => _closedSegments.stream;
 
   Stream<AudioTriggerEvent> get triggerEvents => _triggerEvents.stream;
 
+  /// Acoustic-intelligence detections from the on-device FFT engine.
+  Stream<AcousticDetection> get detections => _analyzer.detections;
+
   bool get isRecording => _running;
+
+  /// The most recent [window] of captured audio (processed PCM16), or null when
+  /// nothing has been captured yet. Used to fingerprint music / transcribe
+  /// speech without re-reading files.
+  ({Uint8List bytes, int sampleRate, int channels})? recentAudio({
+    Duration window = const Duration(seconds: 6),
+  }) {
+    if (_recentChunks.isEmpty) {
+      return null;
+    }
+    final config = _config;
+    final channels = config?.channels ?? 1;
+    final wanted = (_captureRate * channels * 2 * window.inMilliseconds / 1000)
+        .round();
+    final builder = BytesBuilder(copy: false);
+    for (final chunk in _recentChunks) {
+      builder.add(chunk);
+    }
+    var bytes = builder.toBytes();
+    if (bytes.length > wanted && wanted > 0) {
+      bytes = Uint8List.sublistView(bytes, bytes.length - wanted);
+    }
+    return (bytes: bytes, sampleRate: _captureRate, channels: channels);
+  }
 
   Future<void> start(AppConfig config) async {
     if (_running) {
@@ -83,10 +151,22 @@ class SegmentRecorder {
       }
       _resetCaptureState(config);
       _running = true;
+      if (_analysisActive) {
+        await _analyzer.start(
+          sampleRate: config.analyzerSampleRate,
+          fftSize: config.analyzerFftSize,
+          flags: AcousticDetectorFlags(
+            snore: config.snoreDetectionEnabled,
+            music: config.musicDetectionEnabled,
+            speech: config.speechDetectionEnabled,
+          ),
+          captureSessionId: _captureSessionId ?? '',
+        );
+      }
       final stream = await _recorder.startStream(
         RecordConfig(
           encoder: AudioEncoder.pcm16bits,
-          sampleRate: config.sampleRate,
+          sampleRate: _captureRate,
           numChannels: config.channels,
           // Music capture keeps dynamics: platform AGC/denoise default off.
           autoGain: config.autoGain,
@@ -137,6 +217,7 @@ class SegmentRecorder {
           });
     } catch (error) {
       _running = false;
+      await _analyzer.stop();
       _snapshot.add(
         const RecorderSnapshot.idle().copyWith(error: error.toString()),
       );
@@ -164,7 +245,13 @@ class SegmentRecorder {
       await _finishActiveSegment();
       await _recordStreamSubscription?.cancel();
       _recordStreamSubscription = null;
+      if (_analysisActive) {
+        _analyzer.flush();
+        await _analyzer.stop();
+      }
     } finally {
+      _gateOpen = false;
+      _analysisActive = false;
       _stopping = false;
       _snapshot.add(const RecorderSnapshot.idle());
     }
@@ -172,6 +259,7 @@ class SegmentRecorder {
 
   Future<void> dispose() async {
     await stop();
+    await _analyzer.dispose();
     await _snapshot.close();
     await _closedSegments.close();
     await _triggerEvents.close();
@@ -200,6 +288,9 @@ class SegmentRecorder {
     _config = config;
     _captureStartedAtUtc = DateTime.now().toUtc();
     _captureSessionId = _uuid.v4();
+    _captureRate = config.effectiveCaptureSampleRate;
+    _samplesPerSegment = config.samplesPerSegmentAt(_captureRate);
+    _overlapSamples = config.overlapSamplesAt(_captureRate);
     _writer = null;
     _writerStartedAtUtc = null;
     _writerPath = null;
@@ -213,11 +304,30 @@ class SegmentRecorder {
     _commotionSamples = 0;
     _lastCommotionAlertUtc = null;
     _dsp = _AudioDsp.fromConfig(config);
+    _recentChunks.clear();
+    _recentBytes = 0;
+    _recentDb = null;
+    _storeRate = _captureRate;
+    _storeFactor = 1;
+    _storeDownsampler = null;
+
+    // Acoustic gate setup.
+    _analysisActive = config.hasAcousticAnalysis;
+    _gateOpen = false;
+    _gateLoudSamples = 0;
+    _gateQuietSamples = 0;
+    _gateActivationDb = config.analysisActivationDb;
+    _gateSustainSamples = (config.analysisSustainSeconds * _captureRate).round();
+    _gateHoldSamples = (config.analysisHoldSeconds * _captureRate).round();
+    _analyzerDecimFactor = config.analyzerDecimationFactor;
+    _analyzerDownsampler = _analysisActive && _analyzerDecimFactor > 1
+        ? _MonoDownsampler(_analyzerDecimFactor, _captureRate.toDouble())
+        : null;
   }
 
   int _streamBufferSize(AppConfig config) {
     final frameSize = config.channels * 2;
-    final frames = (config.sampleRate / 10).round().clamp(512, 4096);
+    final frames = (_captureRate / 10).round().clamp(512, 4096);
     return frames * frameSize;
   }
 
@@ -235,7 +345,7 @@ class SegmentRecorder {
       if (writer == null) {
         return;
       }
-      final remainingSamples = config.samplesPerSegment - _currentUniqueSamples;
+      final remainingSamples = _samplesPerSegment - _currentUniqueSamples;
       if (remainingSamples <= 0) {
         await _finishActiveSegment();
         continue;
@@ -250,13 +360,19 @@ class SegmentRecorder {
       // Apply client-side gain + tone shaping so stored audio, overlap, and the
       // loudness trigger all see the same processed signal.
       final slice = _dsp?.process(rawSlice, config.channels) ?? rawSlice;
-      await writer.write(slice);
+      // Write at the segment's stored rate (decimated for quiet segments).
+      final store = _storeDownsampler;
+      await writer.write(store == null ? slice : store.process(slice));
       _currentUniqueSamples += takeSamples;
       _totalLiveSamples += takeSamples;
-      _rememberOverlap(slice, config.overlapSamples, frameSize);
-      _detectCommotion(slice, takeSamples);
+      _rememberOverlap(slice, _overlapSamples, frameSize);
+      _rememberRecent(slice);
+      final power = _pcmPower(slice);
+      _detectCommotion(slice, takeSamples, power);
+      _updateAdaptiveLoudness(power);
+      _runAcousticGate(slice, takeSamples, config, power);
       offset = end;
-      if (_currentUniqueSamples >= config.samplesPerSegment) {
+      if (_currentUniqueSamples >= _samplesPerSegment) {
         await _finishActiveSegment();
       }
     }
@@ -310,8 +426,10 @@ class SegmentRecorder {
     _currentUniqueSamples = 0;
     _currentOverlapSamples = math.min(
       _overlapBytes.length ~/ (config.channels * 2),
-      config.overlapSamples,
+      _overlapSamples,
     );
+    // Decide the stored quality for this segment from the trailing loudness.
+    _chooseStoreRate(config);
     final startedAtUtc = _timeForSample(_currentStartSample);
     final path = await _segmentIndex.createSegmentPath(
       startedAtUtc,
@@ -319,12 +437,15 @@ class SegmentRecorder {
     );
     final writer = await WavSegmentWriter.open(
       path: path,
-      sampleRate: config.sampleRate,
+      sampleRate: _storeRate,
       channels: config.channels,
     );
+    final store = _storeDownsampler;
     if (_currentOverlapSamples > 0) {
-      await writer.write(_overlapBytes);
+      final overlap = store == null ? _overlapBytes : store.process(_overlapBytes);
+      await writer.write(overlap);
     }
+    _storedOverlapSamples = writer.sampleCount;
     _writer = writer;
     _writerStartedAtUtc = startedAtUtc;
     _writerPath = path;
@@ -336,6 +457,43 @@ class SegmentRecorder {
         activeSegmentStartedAtUtc: startedAtUtc,
         error: null,
       ),
+    );
+  }
+
+  /// Picks the stored sample rate for the next segment. With adaptive quality
+  /// off, this is always the capture rate (a no-op decimator). With it on, a
+  /// trailing-quiet segment is stored downsampled to save space while loud
+  /// segments keep full quality.
+  void _chooseStoreRate(AppConfig config) {
+    if (!config.adaptiveQualityEnabled) {
+      _storeRate = _captureRate;
+      _storeFactor = 1;
+      _storeDownsampler = null;
+      return;
+    }
+    // Until we have a trailing-loudness reading, keep full quality (treat the
+    // first segment as loud) rather than needlessly downsampling startup audio.
+    final loud = (_recentDb ?? config.adaptiveLoudnessDb) >=
+        config.adaptiveLoudnessDb;
+    if (loud) {
+      _storeRate = _captureRate;
+      _storeFactor = 1;
+      _storeDownsampler = null;
+      return;
+    }
+    final factor = (_captureRate / config.quietSampleRate).round().clamp(1, 16);
+    if (factor <= 1) {
+      _storeRate = _captureRate;
+      _storeFactor = 1;
+      _storeDownsampler = null;
+      return;
+    }
+    _storeFactor = factor;
+    _storeRate = _captureRate ~/ factor;
+    _storeDownsampler = _Pcm16Downsampler(
+      factor,
+      config.channels,
+      _captureRate.toDouble(),
     );
   }
 
@@ -362,18 +520,20 @@ class SegmentRecorder {
     final endedAtUtc = _timeForSample(
       _currentStartSample + _currentUniqueSamples,
     );
+    final storedTotal = writer.sampleCount;
+    final storedUnique = math.max(0, storedTotal - _storedOverlapSamples);
     final segment = RecordingSegment(
       id: SegmentIndex.safeSegmentId(startedAtUtc),
       startedAtUtc: startedAtUtc,
       endedAtUtc: endedAtUtc,
       captureSessionId: _captureSessionId ?? '',
       sequence: _sequence,
-      sampleRate: config.sampleRate,
+      sampleRate: _storeRate,
       channels: config.channels,
-      startSample: _currentStartSample,
-      sampleCount: _currentUniqueSamples,
-      storedSampleCount: writer.sampleCount,
-      overlapSamples: _currentOverlapSamples,
+      startSample: _currentStartSample ~/ _storeFactor,
+      sampleCount: storedUnique,
+      storedSampleCount: storedTotal,
+      overlapSamples: _storedOverlapSamples,
       container: 'wav',
       codec: 'pcm_s16le',
       localPath: path,
@@ -404,13 +564,89 @@ class SegmentRecorder {
     );
   }
 
-  void _detectCommotion(Uint8List bytes, int samples) {
+  void _rememberRecent(Uint8List slice) {
+    final config = _config;
+    if (config == null) {
+      return;
+    }
+    final maxBytes =
+        (_captureRate * config.channels * 2 * _recentWindowSeconds).round();
+    _recentChunks.add(Uint8List.fromList(slice));
+    _recentBytes += slice.length;
+    while (_recentBytes > maxBytes && _recentChunks.length > 1) {
+      _recentBytes -= _recentChunks.removeAt(0).length;
+    }
+  }
+
+  void _updateAdaptiveLoudness(_PcmPower power) {
+    final db = _dbForRms(power.averagePower);
+    _recentDb = _recentDb == null ? db : (0.9 * _recentDb! + 0.1 * db);
+  }
+
+  /// Implements the "kick in once decibels get consistently high" gate and feeds
+  /// the analysis isolate while it is open (including quiet stretches, so gaps
+  /// between snores are observed for apnea detection).
+  void _runAcousticGate(
+    Uint8List slice,
+    int samples,
+    AppConfig config,
+    _PcmPower power,
+  ) {
+    if (!_analysisActive) {
+      return;
+    }
+    final db = _dbForRms(power.averagePower);
+    final loud = db >= _gateActivationDb;
+    if (!_gateOpen) {
+      if (loud) {
+        _gateLoudSamples += samples;
+      } else {
+        _gateLoudSamples = math.max(0, _gateLoudSamples - samples);
+      }
+      if (_gateLoudSamples >= _gateSustainSamples) {
+        _gateOpen = true;
+        _gateQuietSamples = 0;
+        _analyzer.resyncFeed();
+      } else {
+        return;
+      }
+    }
+    // Gate is open: feed audio and track how long it has been quiet.
+    _feedAnalyzer(slice, config);
+    if (loud) {
+      _gateQuietSamples = 0;
+    } else {
+      _gateQuietSamples += samples;
+      if (_gateQuietSamples >= _gateHoldSamples) {
+        _gateOpen = false;
+        _gateLoudSamples = 0;
+        _analyzer.flush();
+      }
+    }
+  }
+
+  void _feedAnalyzer(Uint8List slice, AppConfig config) {
+    final mono = pcm16BytesToMonoDoubles(slice, config.channels);
+    if (mono.isEmpty) {
+      return;
+    }
+    final down = _analyzerDownsampler;
+    final decimated = down == null ? mono : down.process(mono);
+    if (decimated.isEmpty) {
+      return;
+    }
+    // The first sample of this slice corresponds to the current live position
+    // minus the samples we just added.
+    final sliceStart = _totalLiveSamples - (slice.length ~/ (config.channels * 2));
+    _analyzer.addMonoSamples(decimated, _timeForSample(sliceStart));
+  }
+
+  void _detectCommotion(Uint8List bytes, int samples, _PcmPower stats) {
     final config = _config;
     final sessionId = _captureSessionId;
     if (config == null || sessionId == null || bytes.length < 2) {
       return;
     }
-    final stats = _pcmPower(bytes);
     // Higher sensitivity (0..1) lowers the loudness thresholds and the time the
     // sound must be sustained before the "commotion" alert fires.
     final sensitivity = config.noiseTriggerSensitivity.clamp(0.0, 1.0);
@@ -424,7 +660,7 @@ class SegmentRecorder {
       _commotionSamples = math.max(0, _commotionSamples - samples);
     }
     final sustainSeconds = (5.0 - 4.0 * sensitivity).clamp(1.0, 5.0);
-    final sustainedSamples = (config.sampleRate * sustainSeconds).round();
+    final sustainedSamples = (_captureRate * sustainSeconds).round();
     if (_commotionSamples < sustainedSamples) {
       return;
     }
@@ -469,14 +705,20 @@ class SegmentRecorder {
     );
   }
 
+  double _dbForRms(double rms) {
+    if (rms <= 0) {
+      return -120;
+    }
+    return (20 * math.log(rms) / math.ln10).clamp(-120.0, 0.0);
+  }
+
   DateTime _timeForSample(int sample) {
-    final config = _config;
     final captureStartedAt = _captureStartedAtUtc;
-    if (config == null || captureStartedAt == null || config.sampleRate <= 0) {
+    if (captureStartedAt == null || _captureRate <= 0) {
       return DateTime.now().toUtc();
     }
     return captureStartedAt.add(
-      Duration(microseconds: sample * 1000000 ~/ config.sampleRate),
+      Duration(microseconds: sample * 1000000 ~/ _captureRate),
     );
   }
 
@@ -513,7 +755,7 @@ class _AudioDsp {
     if (!config.hasAudioDsp) {
       return null;
     }
-    final fs = config.sampleRate.toDouble();
+    final fs = config.effectiveCaptureSampleRate.toDouble();
     final stages = <_Biquad>[];
     if (config.bassGainDb != 0.0) {
       stages.add(_Biquad.lowShelf(fs, 120, config.bassGainDb));
@@ -550,6 +792,81 @@ class _AudioDsp {
   }
 }
 
+/// Anti-aliased integer downsampler for normalized mono doubles. Used to feed
+/// the FFT analyzer at ~16 kHz regardless of the capture rate.
+class _MonoDownsampler {
+  _MonoDownsampler(this.factor, double fs)
+      : _lp = _Biquad.lowPass(fs, 0.45 * fs / factor, 0.707),
+        _state = _BiquadState();
+
+  final int factor;
+  final _Biquad _lp;
+  final _BiquadState _state;
+  int _phase = 0;
+
+  Float64List process(Float64List input) {
+    if (factor <= 1) {
+      return input;
+    }
+    final out = <double>[];
+    for (final x in input) {
+      final y = _state.process(_lp, x);
+      if (_phase == 0) {
+        out.add(y);
+      }
+      _phase = (_phase + 1) % factor;
+    }
+    return Float64List.fromList(out);
+  }
+}
+
+/// Anti-aliased integer downsampler for interleaved PCM16. Used to store quiet
+/// segments at a lower sample rate. Per-channel filter state and the decimation
+/// phase persist across calls so a segment's stream stays continuous.
+class _Pcm16Downsampler {
+  _Pcm16Downsampler(this.factor, this.channels, double fs)
+      : _lp = _Biquad.lowPass(fs, 0.45 * fs / factor, 0.707),
+        _states = List.generate(channels < 1 ? 1 : channels, (_) => _BiquadState());
+
+  final int factor;
+  final int channels;
+  final _Biquad _lp;
+  final List<_BiquadState> _states;
+  int _phase = 0;
+
+  Uint8List process(Uint8List bytes) {
+    if (factor <= 1) {
+      return bytes;
+    }
+    final ch = channels < 1 ? 1 : channels;
+    final view = ByteData.sublistView(bytes);
+    final frames = bytes.length ~/ (ch * 2);
+    final out = BytesBuilder();
+    final frame = ByteData(ch * 2);
+    for (var f = 0; f < frames; f++) {
+      final keep = _phase == 0;
+      for (var c = 0; c < ch; c++) {
+        var s = view.getInt16((f * ch + c) * 2, Endian.little) / 32768.0;
+        s = _states[c].process(_lp, s);
+        if (keep) {
+          var v = (s * 32768.0).round();
+          if (v > 32767) {
+            v = 32767;
+          } else if (v < -32768) {
+            v = -32768;
+          }
+          frame.setInt16(c * 2, v, Endian.little);
+        }
+      }
+      if (keep) {
+        out.add(frame.buffer.asUint8List(0, ch * 2));
+      }
+      _phase = (_phase + 1) % factor;
+    }
+    return out.toBytes();
+  }
+}
+
 /// Normalized (a0 == 1) biquad coefficients from the RBJ audio EQ cookbook.
 class _Biquad {
   const _Biquad(this.b0, this.b1, this.b2, this.a1, this.a2);
@@ -559,6 +876,21 @@ class _Biquad {
   final double b2;
   final double a1;
   final double a2;
+
+  factory _Biquad.lowPass(double fs, double f0, double q) {
+    final w0 = 2 * math.pi * f0 / fs;
+    final cosW0 = math.cos(w0);
+    final alpha = math.sin(w0) / (2 * q);
+    final a0 = 1 + alpha;
+    final b1 = 1 - cosW0;
+    return _Biquad(
+      (b1 / 2) / a0,
+      b1 / a0,
+      (b1 / 2) / a0,
+      (-2 * cosW0) / a0,
+      (1 - alpha) / a0,
+    );
+  }
 
   factory _Biquad.peaking(double fs, double f0, double q, double gainDb) {
     final a = math.pow(10, gainDb / 40).toDouble();

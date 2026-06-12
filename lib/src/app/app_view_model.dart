@@ -1,3 +1,4 @@
+import '../models/acoustic_detection.dart';
 import '../models/app_config.dart';
 import '../models/cloud_secrets.dart';
 import '../models/cloud_provider.dart';
@@ -19,6 +20,7 @@ class AppViewModel {
     required this.isUploading,
     this.transferStatus = const TransferGateStatus.unknown(),
     this.message,
+    this.detections = const [],
   });
 
   final AppConfig config;
@@ -29,6 +31,9 @@ class AppViewModel {
   final List<String> diagnosticEntries;
   final bool isInitializing;
   final bool isUploading;
+
+  /// Most recent acoustic-intelligence detections, newest first.
+  final List<AcousticDetection> detections;
 
   /// Current power/network gate decision. When [TransferGateStatus.isPaused] is
   /// true, cloud uploads are deferred (local capture continues).

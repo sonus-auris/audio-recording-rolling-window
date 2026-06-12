@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 
 import '../models/app_config.dart';
 import '../models/cloud_secrets.dart';
+import 'crypto/segment_encryptor.dart';
 import 'sound_recorder_backend_client.dart';
 
 class IcloudSyncResult {
@@ -31,12 +32,19 @@ class IcloudSyncService {
     MethodChannel? channel,
     http.Client? httpClient,
     this.downloadTimeout = const Duration(seconds: 45),
+    SegmentEncryptor? encryptor,
   })  : _channel = channel ?? const MethodChannel('audio_dashcam/icloud'),
-        _httpClient = httpClient ?? http.Client();
+        _httpClient = httpClient ?? http.Client(),
+        _encryptor = encryptor;
 
   final MethodChannel _channel;
   final http.Client _httpClient;
   final Duration downloadTimeout;
+
+  /// Decrypts ciphertext fetched from our S3 vault so a *usable* audio file is
+  /// written into the user's own iCloud. This is the user-initiated, per-clip
+  /// "opt-in release" path — decryption happens here on-device, never server-side.
+  final SegmentEncryptor? _encryptor;
 
   /// Whether the device is signed into iCloud and the ubiquity container is
   /// reachable. Returns false on non-iOS platforms (channel not registered).
@@ -88,7 +96,10 @@ class IcloudSyncService {
         continue;
       }
       try {
-        final bytes = await _download(url);
+        final downloaded = await _download(url);
+        final bytes = _encryptor == null
+            ? downloaded
+            : await _encryptor.open(downloaded);
         final fileId = await _writeToIcloud(destinationKey, bytes);
         await backendClient.completeCloudCopyJob(
           config: config,

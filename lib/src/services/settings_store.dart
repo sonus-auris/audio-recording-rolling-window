@@ -33,6 +33,12 @@ class SettingsStore {
   static const _supabaseTokenExpiresAtKey =
       'audio_dashcam.supabase.token_expires_at';
   static const _supabaseEmailKey = 'audio_dashcam.supabase.email';
+  static const _sttApiKeyKey = 'audio_dashcam.stt.api_key';
+  static const _soundCloudAccessKey = 'audio_dashcam.soundcloud.access_token';
+  static const _soundCloudRefreshKey = 'audio_dashcam.soundcloud.refresh_token';
+  static const _spotifyAccessKey = 'audio_dashcam.spotify.access_token';
+  static const _spotifyRefreshKey = 'audio_dashcam.spotify.refresh_token';
+  static const _lastArchivedDayKey = 'audio_dashcam.day_archive.last_day';
 
   final FlutterSecureStorage _secureStorage;
   final Uuid _uuid;
@@ -103,6 +109,15 @@ class SettingsStore {
       supabaseAccessTokenExpiresAt:
           await _secureStorage.read(key: _supabaseTokenExpiresAtKey) ?? '',
       supabaseEmail: await _secureStorage.read(key: _supabaseEmailKey) ?? '',
+      sttApiKey: await _secureStorage.read(key: _sttApiKeyKey) ?? '',
+      soundCloudAccessToken:
+          await _secureStorage.read(key: _soundCloudAccessKey) ?? '',
+      soundCloudRefreshToken:
+          await _secureStorage.read(key: _soundCloudRefreshKey) ?? '',
+      spotifyAccessToken:
+          await _secureStorage.read(key: _spotifyAccessKey) ?? '',
+      spotifyRefreshToken:
+          await _secureStorage.read(key: _spotifyRefreshKey) ?? '',
     );
   }
 
@@ -118,6 +133,28 @@ class SettingsStore {
       secrets.supabaseAccessTokenExpiresAt,
     );
     await _writeSecure(_supabaseEmailKey, secrets.supabaseEmail);
+    await _writeSecure(_sttApiKeyKey, secrets.sttApiKey);
+    await _writeSecure(_soundCloudAccessKey, secrets.soundCloudAccessToken);
+    await _writeSecure(_soundCloudRefreshKey, secrets.soundCloudRefreshToken);
+    await _writeSecure(_spotifyAccessKey, secrets.spotifyAccessToken);
+    await _writeSecure(_spotifyRefreshKey, secrets.spotifyRefreshToken);
+  }
+
+  /// The last local date (yyyy-MM-dd) successfully archived as a "Day of My
+  /// Life", so the archiver doesn't re-publish across restarts. Null if never.
+  Future<DateTime?> loadLastArchivedDay() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_lastArchivedDayKey);
+    if (raw == null || raw.trim().isEmpty) {
+      return null;
+    }
+    return DateTime.tryParse(raw.trim());
+  }
+
+  Future<void> saveLastArchivedDay(DateTime dayLocal) async {
+    final prefs = await SharedPreferences.getInstance();
+    final d = DateTime(dayLocal.year, dayLocal.month, dayLocal.day);
+    await prefs.setString(_lastArchivedDayKey, d.toIso8601String());
   }
 
   Future<void> _writeSecure(String key, String value) async {

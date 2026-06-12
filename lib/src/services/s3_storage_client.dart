@@ -9,6 +9,7 @@ import 'package:http/http.dart' as http;
 import '../models/app_config.dart';
 import '../models/cloud_secrets.dart';
 import '../models/recording_segment.dart';
+import 'crypto/segment_encryptor.dart';
 
 class UploadResult {
   const UploadResult.success(this.remoteKey) : error = null;
@@ -25,10 +26,18 @@ class S3StorageClient {
   S3StorageClient({
     http.Client? httpClient,
     this.requestTimeout = const Duration(seconds: 45),
-  }) : _httpClient = httpClient ?? http.Client();
+    SegmentEncryptor? encryptor,
+  })  : _httpClient = httpClient ?? http.Client(),
+        _encryptor = encryptor;
 
   final http.Client _httpClient;
   final Duration requestTimeout;
+
+  /// When set, local segment files are sealed on-device before the direct-to-S3
+  /// PUT. The SigV4 payload hash is computed over the ciphertext that is sent.
+  /// Server-side object copies ([_copyObject]) are untouched — they move bytes
+  /// that are already ciphertext.
+  final SegmentEncryptor? _encryptor;
 
   Future<UploadResult> uploadSegment({
     required AppConfig config,
@@ -172,7 +181,9 @@ class S3StorageClient {
     required String contentType,
   }) async {
     try {
-      final bytes = await file.readAsBytes();
+      final plaintext = await file.readAsBytes();
+      final bytes =
+          _encryptor == null ? plaintext : await _encryptor.seal(plaintext);
       final uri = _objectUri(config, key);
       final payloadHash = sha256.convert(bytes).toString();
       final headers = _signedHeaders(

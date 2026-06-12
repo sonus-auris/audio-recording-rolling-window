@@ -8,6 +8,11 @@ class CloudSecrets {
     this.supabaseRefreshToken = '',
     this.supabaseAccessTokenExpiresAt = '',
     this.supabaseEmail = '',
+    this.sttApiKey = '',
+    this.soundCloudAccessToken = '',
+    this.soundCloudRefreshToken = '',
+    this.spotifyAccessToken = '',
+    this.spotifyRefreshToken = '',
   });
 
   final String s3AccessKeyId;
@@ -29,6 +34,24 @@ class CloudSecrets {
 
   /// Email of the signed-in Supabase user, for display only.
   final String supabaseEmail;
+
+  /// API key/bearer for the opt-in cloud speech-to-text endpoint. Secret; empty
+  /// when STT is unconfigured.
+  final String sttApiKey;
+
+  /// OAuth tokens for the user's linked SoundCloud account. Empty when unlinked.
+  final String soundCloudAccessToken;
+  final String soundCloudRefreshToken;
+
+  /// OAuth tokens for the user's linked Spotify account. Empty when unlinked.
+  final String spotifyAccessToken;
+  final String spotifyRefreshToken;
+
+  bool get hasSttApiKey => sttApiKey.trim().isNotEmpty;
+
+  bool get hasSoundCloudToken => soundCloudAccessToken.trim().isNotEmpty;
+
+  bool get hasSpotifyToken => spotifyAccessToken.trim().isNotEmpty;
 
   bool get hasS3Credentials =>
       s3AccessKeyId.trim().isNotEmpty && s3SecretAccessKey.trim().isNotEmpty;
@@ -76,6 +99,11 @@ class CloudSecrets {
     String? supabaseRefreshToken,
     String? supabaseAccessTokenExpiresAt,
     String? supabaseEmail,
+    String? sttApiKey,
+    String? soundCloudAccessToken,
+    String? soundCloudRefreshToken,
+    String? spotifyAccessToken,
+    String? spotifyRefreshToken,
   }) {
     return CloudSecrets(
       s3AccessKeyId: s3AccessKeyId ?? this.s3AccessKeyId,
@@ -87,6 +115,13 @@ class CloudSecrets {
       supabaseAccessTokenExpiresAt:
           supabaseAccessTokenExpiresAt ?? this.supabaseAccessTokenExpiresAt,
       supabaseEmail: supabaseEmail ?? this.supabaseEmail,
+      sttApiKey: sttApiKey ?? this.sttApiKey,
+      soundCloudAccessToken:
+          soundCloudAccessToken ?? this.soundCloudAccessToken,
+      soundCloudRefreshToken:
+          soundCloudRefreshToken ?? this.soundCloudRefreshToken,
+      spotifyAccessToken: spotifyAccessToken ?? this.spotifyAccessToken,
+      spotifyRefreshToken: spotifyRefreshToken ?? this.spotifyRefreshToken,
     );
   }
 
@@ -98,6 +133,18 @@ class CloudSecrets {
       s3SecretAccessKey: s3SecretAccessKey,
       s3SessionToken: s3SessionToken,
       backendDeviceToken: backendDeviceToken,
+      sttApiKey: sttApiKey,
+      soundCloudAccessToken: soundCloudAccessToken,
+      soundCloudRefreshToken: soundCloudRefreshToken,
+      spotifyAccessToken: spotifyAccessToken,
+      spotifyRefreshToken: spotifyRefreshToken,
     );
   }
+
+  /// Clears the tokens for one linked music account on unlink.
+  CloudSecrets withoutSpotify() =>
+      copyWith(spotifyAccessToken: '', spotifyRefreshToken: '');
+
+  CloudSecrets withoutSoundCloud() =>
+      copyWith(soundCloudAccessToken: '', soundCloudRefreshToken: '');
 }

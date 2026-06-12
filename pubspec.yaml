@@ -43,6 +43,14 @@ dependencies:
   just_audio: ^0.10.5
   http: ^1.6.0
   crypto: ^3.0.7
+  # AES-256-GCM + Argon2id/HKDF for on-device, zero-knowledge segment encryption.
+  cryptography: ^2.7.0
+  # Optional GPS evidence tagging (prove where a clip was recorded).
+  geolocator: ^13.0.2
+  # Reverse geocoding for opt-in place names in Day-of-My-Life notes.
+  geocoding: ^3.0.0
+  # Browser-based OAuth (PKCE) for linking SoundCloud / Spotify.
+  flutter_web_auth_2: ^4.1.0
   uuid: ^4.5.3
   intl: ^0.20.2
   path: ^1.9.1
@@ -74,6 +82,13 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # Sonus Auris brand typeface (rounded). Variable font; Flutter maps
+  # FontWeight onto the wght axis (400..800).
+  fonts:
+    - family: Baloo 2
+      fonts:
+        - asset: assets/fonts/Baloo2-VF.ttf
 
   # To add assets to your application, add an assets section, like this:
   # assets:

@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:rxdart/rxdart.dart';
 
+import '../models/acoustic_detection.dart';
 import '../models/audio_trigger_event.dart';
 import '../models/app_config.dart';
 import '../models/cloud_provider.dart';
@@ -14,7 +16,11 @@ import '../models/recording_segment.dart';
 import '../models/supabase_session.dart';
 import '../models/transfer_gate_status.dart';
 import '../services/background_capture_service.dart';
+import '../services/crypto/flutter_secure_key_store.dart';
+import '../services/crypto/key_manager.dart';
+import '../services/crypto/segment_encryptor.dart';
 import '../services/icloud_sync_service.dart';
+import '../services/location_service.dart';
 import '../services/diagnostic_log.dart';
 import '../services/playback_service.dart';
 import '../services/power_network_gate.dart';
@@ -23,8 +29,16 @@ import '../services/s3_storage_client.dart';
 import '../services/segment_index.dart';
 import '../services/segment_recorder.dart';
 import '../services/settings_store.dart';
+import '../services/shazam_client.dart';
+import '../services/memory_publisher.dart';
+import '../services/day_of_life_archiver.dart';
+import '../services/music_oauth_service.dart';
+import '../services/oauth_browser.dart';
 import '../services/sound_recorder_backend_client.dart';
+import '../services/speech_to_text_client.dart';
+import '../services/on_device_speech_client.dart';
 import '../services/supabase_auth_client.dart';
+import '../services/supabase_rest_client.dart';
 import 'app_view_model.dart';
 
 /// Consent string recorded against the device on registration. Bump when the
@@ -44,10 +58,25 @@ class AppController {
     IcloudSyncService? icloudSyncService,
     DiagnosticLog? diagnosticLog,
     RecordingFeedback? feedback,
+    LocationService? locationService,
     PowerNetworkGate? powerNetworkGate,
+    SupabaseRestClient? supabaseRestClient,
+    ShazamClient? shazamClient,
+    MemoryPublisher? memoryPublisher,
+    DayOfLifeArchiver? dayOfLifeArchiver,
+    MusicOAuthService? musicOAuthService,
+    OAuthBrowser? oauthBrowser,
+    SpeechToTextClient? speechToTextClient,
+    OnDeviceSpeechClient? onDeviceSpeechClient,
   }) {
     final effectiveSegmentIndex = segmentIndex ?? SegmentIndex();
     final effectiveDiagnostics = diagnosticLog ?? DiagnosticLog();
+    // One device-bound encryptor shared by every cloud path, so audio is sealed
+    // on-device before upload and only ever opened locally. The master key lives
+    // in the Keychain/Keystore via FlutterSecureKeyStore.
+    final encryptor = SegmentEncryptor(
+      keyManager: KeyManager(store: FlutterSecureKeyStore()),
+    );
     return AppController._(
       settingsStore: settingsStore ?? SettingsStore(),
       segmentIndex: effectiveSegmentIndex,
@@ -57,13 +86,24 @@ class AppController {
       backgroundCaptureService:
           backgroundCaptureService ??
           BackgroundCaptureService(diagnostics: effectiveDiagnostics),
-      s3StorageClient: s3StorageClient ?? S3StorageClient(),
-      backendClient: backendClient ?? SoundRecorderBackendClient(),
+      s3StorageClient: s3StorageClient ?? S3StorageClient(encryptor: encryptor),
+      backendClient:
+          backendClient ?? SoundRecorderBackendClient(encryptor: encryptor),
       authClient: authClient ?? SupabaseAuthClient(),
-      icloudSyncService: icloudSyncService ?? IcloudSyncService(),
+      icloudSyncService:
+          icloudSyncService ?? IcloudSyncService(encryptor: encryptor),
       diagnostics: effectiveDiagnostics,
       feedback: feedback ?? RecordingFeedback(),
+      locationService: locationService ?? LocationService(),
       powerNetworkGate: powerNetworkGate ?? PowerNetworkGate(),
+      supabaseRestClient: supabaseRestClient ?? SupabaseRestClient(),
+      shazamClient: shazamClient ?? ShazamClient(),
+      memoryPublisher: memoryPublisher ?? MemoryPublisher(),
+      dayOfLifeArchiver: dayOfLifeArchiver ?? DayOfLifeArchiver(),
+      musicOAuthService: musicOAuthService ?? MusicOAuthService(),
+      oauthBrowser: oauthBrowser ?? const FlutterWebAuthBrowser(),
+      speechToTextClient: speechToTextClient ?? SpeechToTextClient(),
+      onDeviceSpeechClient: onDeviceSpeechClient ?? OnDeviceSpeechClient(),
     );
   }
 
@@ -79,7 +119,16 @@ class AppController {
     required this._icloudSyncService,
     required this._diagnostics,
     required this._feedback,
+    required this._locationService,
     required this._powerNetworkGate,
+    required this._supabaseRestClient,
+    required this._shazamClient,
+    required this._memoryPublisher,
+    required this._dayOfLifeArchiver,
+    required this._musicOAuthService,
+    required this._oauthBrowser,
+    required this._speechToTextClient,
+    required this._onDeviceSpeechClient,
   }) {
     // Pre-combine the upload flag and transfer-gate status into one record so
     // both ride a single slot of the (max-arity-9) combineLatest below.
@@ -94,6 +143,19 @@ class AppController {
           (isUploading, transfer) =>
               (isUploading: isUploading, transfer: transfer),
         );
+    // Fold the message and detections list into one slot (combineLatest is at
+    // its max arity of 9 below).
+    final messageAndDetections =
+        Rx.combineLatest2<
+          String?,
+          List<AcousticDetection>,
+          ({String? message, List<AcousticDetection> detections})
+        >(
+          _message,
+          _detectionsList,
+          (message, detections) =>
+              (message: message, detections: detections),
+        );
     _viewModels =
         Rx.combineLatest9<
               AppConfig,
@@ -104,7 +166,7 @@ class AppController {
               List<String>,
               bool,
               ({bool isUploading, TransferGateStatus transfer}),
-              String?,
+              ({String? message, List<AcousticDetection> detections}),
               AppViewModel
             >(
               _config,
@@ -115,7 +177,7 @@ class AppController {
               _diagnostics.entries,
               _isInitializing,
               uploadStatus,
-              _message,
+              messageAndDetections,
               (
                 config,
                 secrets,
@@ -125,7 +187,7 @@ class AppController {
                 diagnosticEntries,
                 isInitializing,
                 uploadState,
-                message,
+                messageState,
               ) {
                 return AppViewModel(
                   config: config,
@@ -137,7 +199,8 @@ class AppController {
                   isInitializing: isInitializing,
                   isUploading: uploadState.isUploading,
                   transferStatus: uploadState.transfer,
-                  message: message,
+                  message: messageState.message,
+                  detections: messageState.detections,
                 );
               },
             )
@@ -155,7 +218,19 @@ class AppController {
   final IcloudSyncService _icloudSyncService;
   final DiagnosticLog _diagnostics;
   final RecordingFeedback _feedback;
+  final LocationService _locationService;
   final PowerNetworkGate _powerNetworkGate;
+  final SupabaseRestClient _supabaseRestClient;
+  final ShazamClient _shazamClient;
+  final MemoryPublisher _memoryPublisher;
+  final DayOfLifeArchiver _dayOfLifeArchiver;
+  final MusicOAuthService _musicOAuthService;
+  final OAuthBrowser _oauthBrowser;
+  DateTime? _lastSeenLocalDay;
+  DateTime? _lastArchivedDay;
+  bool _archiveCaughtUp = false;
+  final SpeechToTextClient _speechToTextClient;
+  final OnDeviceSpeechClient _onDeviceSpeechClient;
   Future<void>? _deviceRegistrationInFlight;
   Future<void>? _supabaseRefreshInFlight;
   Future<void>? _icloudSyncInFlight;
@@ -177,11 +252,17 @@ class AppController {
   final BehaviorSubject<TransferGateStatus> _transfer =
       BehaviorSubject.seeded(const TransferGateStatus.unknown());
   final BehaviorSubject<String?> _message = BehaviorSubject.seeded(null);
+  final BehaviorSubject<List<AcousticDetection>> _detectionsList =
+      BehaviorSubject.seeded(const []);
   final PublishSubject<void> _uploadRequests = PublishSubject();
+
+  /// Newest-first rolling window of acoustic detections kept for the UI.
+  static const int _maxDetectionsKept = 100;
 
   late final Stream<AppViewModel> _viewModels;
   StreamSubscription<void>? _closedSegmentsSubscription;
   StreamSubscription<dynamic>? _triggerSubscription;
+  StreamSubscription<dynamic>? _detectionsSubscription;
   StreamSubscription<dynamic>? _uploadSubscription;
   BackendUploadSession? _backendSession;
   String? _backendSessionKey;
@@ -221,6 +302,15 @@ class AppController {
             _message.add('Audio alert failed: $error');
           },
         );
+    // Handle detections without back-pressuring the (broadcast) source: a slow
+    // Shazam/STT enrichment must not pause the stream and drop later detections.
+    // _onDetection is self-contained and swallows its own errors.
+    _detectionsSubscription = _recorder.detections.listen(
+      (detection) => unawaited(_onDetection(detection)),
+      onError: (Object error) {
+        _diagnostics.add('Acoustic detection stream error: $error');
+      },
+    );
     _uploadSubscription = _uploadRequests
         .debounceTime(const Duration(milliseconds: 250))
         .exhaustMap((_) => Stream.fromFuture(_drainUploads()))
@@ -349,6 +439,17 @@ class AppController {
         1,
         100,
       ),
+      analysisActivationDb: config.analysisActivationDb.clamp(-90.0, 0.0),
+      analysisSustainSeconds: config.analysisSustainSeconds.clamp(0.5, 30.0),
+      analysisHoldSeconds: config.analysisHoldSeconds.clamp(0.0, 600.0),
+      keywords: config.keywords
+          .map((k) => k.trim())
+          .where((k) => k.isNotEmpty)
+          .toList(),
+      sttEndpoint: config.sttEndpoint.trim(),
+      captureSampleRate: config.captureSampleRate.clamp(8000, 48000),
+      quietSampleRate: config.quietSampleRate.clamp(8000, 48000),
+      adaptiveLoudnessDb: config.adaptiveLoudnessDb.clamp(-90.0, 0.0),
     );
     if (_backendSessionKey != _sessionKey(normalized, _secrets.valueOrNull)) {
       _backendSession = null;
@@ -684,6 +785,56 @@ class AppController {
     requestUploadDrain();
   }
 
+  /// Battery-friendly voice profile (16 kHz) vs. the music-grade high-fidelity
+  /// profile (48 kHz). The capture rate is what the mic stream opens at.
+  static const int mediumQualitySampleRate = 16000;
+  static const int highQualitySampleRate = 48000;
+
+  /// True when capture is running at the high-fidelity profile.
+  bool get isHighQualityRecording =>
+      _config.hasValue && _config.value.sampleRate >= highQualitySampleRate;
+
+  /// Switches between the medium (voice) and high (music-grade) capture
+  /// profiles, speaks a confirmation prompt, and — when capture is live —
+  /// restarts the mic stream so the new sample rate takes effect at once.
+  Future<void> setHighQualityRecording(bool enabled) async {
+    if (!_config.hasValue) {
+      return;
+    }
+    final target = enabled ? highQualitySampleRate : mediumQualitySampleRate;
+    final current = _config.value;
+    if (current.sampleRate == target) {
+      return;
+    }
+    await saveConfig(current.copyWith(sampleRate: target));
+    await _feedback.say(
+      enabled
+          ? 'Switching to high quality recording'
+          : 'Switching back to medium quality recording',
+      force: true,
+    );
+    if (_recorder.isRecording) {
+      // Re-open the stream at the new rate without an extra spoken cue.
+      await restartRecording(announce: false);
+    }
+  }
+
+  /// Convenience for a single toggle button.
+  Future<void> toggleHighQualityRecording() =>
+      setHighQualityRecording(!isHighQualityRecording);
+
+  /// Stops and immediately restarts capture — to roll a fresh segment or apply a
+  /// new capture profile. Speaks a "Restarting recording" cue unless [announce]
+  /// is false (e.g. when a quality switch already announced the change).
+  Future<void> restartRecording({bool announce = true}) async {
+    _diagnostics.add('Restart recording requested.');
+    if (announce) {
+      await _feedback.say('Restarting recording', force: true);
+    }
+    await stopRecording();
+    await startRecording();
+  }
+
   Future<void> playLocalWindow() async {
     await _playback.playSegments(_segments.value);
   }
@@ -761,7 +912,209 @@ class AppController {
         segments: unsaved,
       );
     }
+    // A permanent save is an explicit user action — the moment to add any songs
+    // heard in that range to the user's private Spotify playlist (opt-in).
+    await _publishSpotifyMemoriesForRange(
+      config: config,
+      secrets: secrets,
+      rangeStart: rangeStart,
+      rangeEnd: rangeEnd,
+    );
     await _enforceRetention();
+  }
+
+  /// Adds songs Shazam recognised in a saved range to the user's private Spotify
+  /// "memories" playlist, de-duplicated. Opt-in and best-effort.
+  Future<void> _publishSpotifyMemoriesForRange({
+    required AppConfig config,
+    required CloudSecrets secrets,
+    required DateTime rangeStart,
+    required DateTime rangeEnd,
+  }) async {
+    if (!_memoryPublisher.wantsSpotify(config, secrets)) {
+      return;
+    }
+    final songs = _recognisedSongsInRange(rangeStart, rangeEnd);
+    if (songs.isEmpty) {
+      return;
+    }
+    try {
+      final result = await _memoryPublisher.publishRecognisedSongs(
+        config: config,
+        secrets: secrets,
+        recognisedSongs: songs,
+      );
+      if (result.didAnything) {
+        _message.add(result.notes.join(' '));
+        await _feedback.say('Added to your Spotify memories', force: true);
+      }
+    } catch (error) {
+      _diagnostics.add('Spotify memory publish failed: $error');
+    }
+  }
+
+  /// Concatenates the local plaintext WAV segments in a saved range into a single
+  /// WAV for upload. Returns null when no local audio is available (e.g. the
+  /// clip has already rolled off the device). Local files are plaintext —
+  /// encryption only happens on the way to the cloud.
+  Future<Uint8List?> _assembleClipWav(List<RecordingSegment> segments) async {
+    final pcm = BytesBuilder(copy: false);
+    var sampleRate = 0;
+    var channels = 1;
+    for (final segment in segments) {
+      final path = segment.localPath;
+      if (path == null) {
+        continue;
+      }
+      final file = File(path);
+      if (!await file.exists()) {
+        continue;
+      }
+      final bytes = await file.readAsBytes();
+      if (bytes.length <= 44) {
+        continue; // header-only / empty
+      }
+      pcm.add(bytes.sublist(44)); // strip the 44-byte WAV header, keep PCM
+      if (segment.sampleRate > 0) {
+        sampleRate = segment.sampleRate;
+      }
+      if (segment.channels > 0) {
+        channels = segment.channels;
+      }
+    }
+    final pcmBytes = pcm.toBytes();
+    if (pcmBytes.isEmpty || sampleRate == 0) {
+      return null;
+    }
+    return wavBytesFromPcm16(pcmBytes, sampleRate, channels);
+  }
+
+  /// Distinct songs Shazam recognised within the saved range, newest first.
+  List<RecognisedSong> _recognisedSongsInRange(
+    DateTime rangeStart,
+    DateTime rangeEnd,
+  ) {
+    final out = <RecognisedSong>[];
+    final seen = <String>{};
+    for (final detection in _detectionsList.value) {
+      if (detection.kind != AcousticDetectionKind.music) {
+        continue;
+      }
+      if (!detection.startedAtUtc.isBefore(rangeEnd) ||
+          !detection.endedAtUtc.isAfter(rangeStart)) {
+        continue;
+      }
+      final title = (detection.details['title'] as String?)?.trim() ?? '';
+      if (title.isEmpty) {
+        continue;
+      }
+      final artist = (detection.details['artist'] as String?)?.trim();
+      final key = '$title|${artist ?? ''}'.toLowerCase();
+      if (seen.add(key)) {
+        out.add(RecognisedSong(title: title, artist: artist));
+      }
+    }
+    return out;
+  }
+
+  // --- Music account linking (SoundCloud / Spotify) -------------------------
+
+  bool get isSpotifyLinked => _secrets.valueOrNull?.hasSpotifyToken ?? false;
+  bool get isSoundCloudLinked =>
+      _secrets.valueOrNull?.hasSoundCloudToken ?? false;
+
+  Future<void> linkSpotify() => _linkMusic(
+        label: 'Spotify',
+        config: MusicOAuthService.spotify(
+          clientId: MusicOAuthConstants.spotifyClientId,
+          redirectUri: MusicOAuthConstants.redirectUri,
+        ),
+        apply: (secrets, tokens) => secrets.copyWith(
+          spotifyAccessToken: tokens.accessToken,
+          spotifyRefreshToken: tokens.refreshToken ?? '',
+        ),
+      );
+
+  Future<void> linkSoundCloud() => _linkMusic(
+        label: 'SoundCloud',
+        config: MusicOAuthService.soundCloud(
+          clientId: MusicOAuthConstants.soundCloudClientId,
+          redirectUri: MusicOAuthConstants.redirectUri,
+        ),
+        apply: (secrets, tokens) => secrets.copyWith(
+          soundCloudAccessToken: tokens.accessToken,
+          soundCloudRefreshToken: tokens.refreshToken ?? '',
+        ),
+      );
+
+  Future<void> unlinkSpotify() async {
+    if (!_secrets.hasValue) return;
+    await saveSecrets(_secrets.value.withoutSpotify());
+    _message.add('Spotify unlinked.');
+  }
+
+  Future<void> unlinkSoundCloud() async {
+    if (!_secrets.hasValue) return;
+    await saveSecrets(_secrets.value.withoutSoundCloud());
+    _message.add('SoundCloud unlinked.');
+  }
+
+  /// Shared OAuth-with-PKCE link flow: build the URL, run the browser leg,
+  /// verify state, exchange the code, and persist the tokens via [apply].
+  Future<void> _linkMusic({
+    required String label,
+    required OAuthProviderConfig config,
+    required CloudSecrets Function(CloudSecrets, OAuthTokens) apply,
+  }) async {
+    if (!config.isConfigured) {
+      _message.add(
+        '$label isn\'t configured in this build (missing client id).',
+      );
+      return;
+    }
+    if (!_secrets.hasValue) {
+      _message.add('Sign in before linking $label.');
+      return;
+    }
+    try {
+      final pkce = _musicOAuthService.generatePkce();
+      final state = _musicOAuthService.randomState();
+      final url = _musicOAuthService.buildAuthorizeUrl(
+        config: config,
+        state: state,
+        codeChallenge: pkce.challenge,
+      );
+      final redirect = await _oauthBrowser.authorize(
+        url: url,
+        callbackScheme: MusicOAuthConstants.callbackScheme,
+      );
+      if (redirect == null) {
+        _message.add('$label linking was cancelled.');
+        return;
+      }
+      if (redirect.queryParameters['state'] != state) {
+        _message.add('$label linking failed: state mismatch.');
+        return;
+      }
+      final code = redirect.queryParameters['code'];
+      if (code == null || code.isEmpty) {
+        _message.add('$label linking failed: no authorization code.');
+        return;
+      }
+      final tokens = await _musicOAuthService.exchangeCode(
+        config: config,
+        code: code,
+        codeVerifier: pkce.verifier,
+      );
+      if (tokens == null) {
+        _message.add('$label linking failed: token exchange error.');
+        return;
+      }
+      await saveSecrets(apply(_secrets.value, tokens));
+      _message.add('$label linked.');
+    } catch (error) {
+      _message.add('$label linking failed: ${_describeError(error)}');
+    }
   }
 
   Future<void> sendManualAlert() {
@@ -999,6 +1352,7 @@ class AppController {
   Future<void> dispose() async {
     await _closedSegmentsSubscription?.cancel();
     await _triggerSubscription?.cancel();
+    await _detectionsSubscription?.cancel();
     await _uploadSubscription?.cancel();
     await _transferConditionsSubscription?.cancel();
     await _uploadRequests.close();
@@ -1008,6 +1362,11 @@ class AppController {
     _icloudSyncService.close();
     _backendClient.close();
     _authClient.close();
+    _supabaseRestClient.close();
+    _speechToTextClient.close();
+    _memoryPublisher.close();
+    _dayOfLifeArchiver.close();
+    _musicOAuthService.close();
     await _feedback.dispose();
     await _diagnostics.dispose();
     await _config.close();
@@ -1017,14 +1376,143 @@ class AppController {
     await _isUploading.close();
     await _transfer.close();
     await _message.close();
+    await _detectionsList.close();
   }
 
   Future<void> _onSegmentClosed(RecordingSegment segment) async {
-    await _segmentIndex.upsertSegment(segment);
+    final tagged = await _attachGeoTag(segment);
+    await _segmentIndex.upsertSegment(tagged);
     final nextSegments = await _segmentIndex.loadSegments();
     _segments.add(nextSegments);
     requestUploadDrain();
+    await _maybeArchivePreviousDay();
     await _enforceRetention();
+  }
+
+  /// Detects a local calendar-day rollover and, if the "Day of My Life"
+  /// SoundCloud archive is enabled, publishes the day that just ended. The
+  /// last-seen day is tracked in memory; days missed while the app was fully
+  /// closed are not back-filled (a catch-up pass is a follow-up).
+  Future<void> _maybeArchivePreviousDay() async {
+    if (!_config.hasValue || !_secrets.hasValue) {
+      return;
+    }
+    final today = _localDateOnly(DateTime.now());
+    if (!_dayOfLifeArchiver.isEnabled(_config.value, _secrets.value)) {
+      _lastSeenLocalDay = today;
+      return;
+    }
+    _lastArchivedDay ??= await _settingsStore.loadLastArchivedDay();
+
+    // One-time startup catch-up: if yesterday was never archived (e.g. the app
+    // was closed across midnight), publish it now. Bounded to a single day —
+    // multi-day backfill is intentionally out of scope.
+    if (!_archiveCaughtUp) {
+      _archiveCaughtUp = true;
+      final yesterday =
+          _localDateOnly(DateTime.now().subtract(const Duration(days: 1)));
+      if (_lastArchivedDay == null || yesterday.isAfter(_lastArchivedDay!)) {
+        await _archiveDayOfLife(yesterday);
+      }
+    }
+
+    final last = _lastSeenLocalDay;
+    _lastSeenLocalDay = today;
+    if (last == null || !today.isAfter(last)) {
+      return; // same local day, or first segment since launch
+    }
+    // The day rolled over; archive the day that just ended (once).
+    if (_lastArchivedDay == null || last.isAfter(_lastArchivedDay!)) {
+      await _archiveDayOfLife(last);
+    }
+  }
+
+  /// Assembles [dayLocal]'s local audio + on-device activity notes and publishes
+  /// it as a private "Day of My Life" SoundCloud track, pruning the rolling
+  /// window. Best-effort; never throws into the capture pipeline.
+  Future<void> _archiveDayOfLife(DateTime dayLocal) async {
+    try {
+      final dayStartUtc = dayLocal.toUtc();
+      final dayEndUtc = dayLocal.add(const Duration(days: 1)).toUtc();
+      final segments =
+          (await _segmentIndex.loadSegments())
+              .where(
+                (s) =>
+                    s.endedAtUtc.isAfter(dayStartUtc) &&
+                    s.startedAtUtc.isBefore(dayEndUtc),
+              )
+              .toList()
+            ..sort((a, b) => a.startedAtUtc.compareTo(b.startedAtUtc));
+      if (segments.isEmpty) {
+        return;
+      }
+      final wav = await _assembleClipWav(segments);
+      final geo = [
+        for (final s in segments)
+          if (s.geoTag != null) s.geoTag!,
+      ];
+      final detections = _detectionsList.value
+          .where(
+            (d) =>
+                d.startedAtUtc.isBefore(dayEndUtc) &&
+                d.endedAtUtc.isAfter(dayStartUtc),
+          )
+          .toList();
+      final result = await _dayOfLifeArchiver.archiveDay(
+        secrets: _secrets.value,
+        dayLocal: dayLocal,
+        wavBytes: wav,
+        detections: detections,
+        geo: geo,
+        resolvePlaces:
+            _config.value.placeNamesEnabled && _config.value.locationTaggingEnabled,
+      );
+      if (result.didUpload) {
+        _lastArchivedDay = dayLocal;
+        await _settingsStore.saveLastArchivedDay(dayLocal);
+        _message.add(
+          'Published "Day of My Life" to SoundCloud '
+          '(${result.noteCount} note(s)'
+          '${result.prunedCount > 0 ? ', pruned ${result.prunedCount} old day(s)' : ''}).',
+        );
+        await _feedback.say('Day of my life saved', force: true);
+      } else if (result.note != null) {
+        _diagnostics.add('Day of My Life: ${result.note}');
+      }
+    } catch (error) {
+      _diagnostics.add('Day of My Life archive failed: $error');
+    }
+  }
+
+  DateTime _localDateOnly(DateTime dt) {
+    final local = dt.toLocal();
+    return DateTime(local.year, local.month, local.day);
+  }
+
+  /// Stamps a closed segment with the current GPS fix when location tagging is
+  /// enabled. Best-effort: a missing fix leaves the segment untagged and never
+  /// blocks indexing or upload — evidence is added when available, never required.
+  Future<RecordingSegment> _attachGeoTag(RecordingSegment segment) async {
+    if (!_config.hasValue ||
+        !_config.value.locationTaggingEnabled ||
+        segment.geoTag != null) {
+      return segment;
+    }
+    try {
+      final tag = await _locationService.currentTag();
+      if (tag == null) {
+        return segment;
+      }
+      _diagnostics.add(
+        'Tagged segment ${segment.sequence} @ '
+        '${tag.latitude.toStringAsFixed(5)}, '
+        '${tag.longitude.toStringAsFixed(5)} (${tag.accuracyLabel}).',
+      );
+      return segment.copyWith(geoTag: tag);
+    } catch (error) {
+      _diagnostics.add('Location tag skipped: $error');
+      return segment;
+    }
   }
 
   Future<void> _drainUploads() async {
@@ -1326,6 +1814,163 @@ class AppController {
       );
     }
     _message.add(_permanentSaveSummary(saved: saved, failed: failed));
+  }
+
+  /// Handles one acoustic detection from the FFT engine: optionally enriches it
+  /// (ShazamKit song id, cloud STT keyword scan), surfaces it in the UI, and
+  /// stores it to Supabase. Errors are logged, never thrown to the stream.
+  Future<void> _onDetection(AcousticDetection detection) async {
+    if (!_config.hasValue) {
+      return;
+    }
+    // Self-contained: this runs fire-and-forget off a broadcast stream, so it
+    // must never let an error escape (it would become an unhandled async error).
+    try {
+      final config = _config.value;
+      var enriched = detection;
+
+      // Music → ShazamKit (iOS only, opt-in).
+      if (detection.kind == AcousticDetectionKind.music &&
+          config.shazamEnabled &&
+          _shazamClient.isSupported) {
+        final clip = _recorder.recentAudio(window: const Duration(seconds: 5));
+        if (clip != null) {
+          try {
+            final match = await _shazamClient.identify(
+              pcm16: clip.bytes,
+              sampleRate: clip.sampleRate,
+              channels: clip.channels,
+            );
+            if (match != null) {
+              enriched = detection.copyWith(
+                details: {...detection.details, ...match.toDetails()},
+              );
+            }
+          } catch (error) {
+            _diagnostics.add('Shazam match failed: $error');
+          }
+        }
+      }
+
+      // Speech → keyword scan. Transcription runs on-device by default (audio
+      // stays in the local plaintext window); cloud STT is only an explicit
+      // opt-in.
+      if (detection.kind == AcousticDetectionKind.speech &&
+          config.keywords.isNotEmpty) {
+        await _scanSpeechForKeywords(config, detection);
+      }
+
+      _appendDetection(enriched);
+      await _storeDetections([enriched]);
+    } catch (error) {
+      _diagnostics.add('Acoustic detection handling failed: $error');
+    }
+  }
+
+  Future<void> _scanSpeechForKeywords(
+    AppConfig config,
+    AcousticDetection speech,
+  ) async {
+    final clip = _recorder.recentAudio(window: const Duration(seconds: 6));
+    if (clip == null) {
+      return;
+    }
+    try {
+      String? transcript;
+      // 1) On-device transcription — the default. Audio never leaves the phone.
+      if (await _onDeviceSpeechClient.isAvailable()) {
+        transcript = await _onDeviceSpeechClient.transcribe(
+          pcm16: clip.bytes,
+          sampleRate: clip.sampleRate,
+          channels: clip.channels,
+        );
+      }
+      // 2) Cloud STT — explicit opt-in only; this is the one path that sends
+      // audio off-device, and it runs solely when the user has enabled it.
+      if (transcript == null && _speechToTextClient.canTranscribe(config)) {
+        transcript = await _speechToTextClient.transcribe(
+          config: config,
+          secrets: _secrets.valueOrNull ?? const CloudSecrets(),
+          pcm16: clip.bytes,
+          sampleRate: clip.sampleRate,
+          channels: clip.channels,
+        );
+      }
+      if (transcript == null) {
+        return;
+      }
+      final match = _speechToTextClient.matchKeyword(config, transcript);
+      if (match == null) {
+        return;
+      }
+      final keywordEvent = AcousticDetection(
+        kind: AcousticDetectionKind.keyword,
+        startedAtUtc: speech.startedAtUtc,
+        endedAtUtc: speech.endedAtUtc,
+        confidence: 1.0,
+        captureSessionId: speech.captureSessionId,
+        details: {'keyword': match.keyword, 'transcript': match.transcript},
+      );
+      _appendDetection(keywordEvent);
+      await _storeDetections([keywordEvent]);
+      // Reuse the existing magic-phrase alert/email path.
+      await _sendAlertForEvent(
+        AudioTriggerEvent(
+          type: AudioTriggerType.magicPhrase,
+          occurredAtUtc: speech.startedAtUtc,
+          captureSessionId: speech.captureSessionId,
+          sampleIndex: 0,
+          phrase: match.keyword,
+        ),
+      );
+    } catch (error) {
+      _diagnostics.add('Speech-to-text scan failed: $error');
+    }
+  }
+
+  void _appendDetection(AcousticDetection detection) {
+    if (_detectionsList.isClosed) {
+      return;
+    }
+    final next = [detection, ..._detectionsList.value];
+    if (next.length > _maxDetectionsKept) {
+      next.removeRange(_maxDetectionsKept, next.length);
+    }
+    _detectionsList.add(next);
+  }
+
+  /// Detail keys never written to the cloud — raw recognized speech is sensitive
+  /// and stays on-device (used only for the local alert), so it is stripped
+  /// before any row leaves the device.
+  static const Set<String> _redactedDetailKeys = {'transcript'};
+
+  /// Persists detections to Supabase under the signed-in user (RLS-scoped).
+  /// No-ops silently when Supabase is unconfigured or there is no session.
+  /// Sensitive detail fields are redacted before upload.
+  Future<void> _storeDetections(List<AcousticDetection> detections) async {
+    if (detections.isEmpty || !_config.hasValue || !_secrets.hasValue) {
+      return;
+    }
+    if (!_supabaseRestClient.canInsert(_config.value, _secrets.value)) {
+      return;
+    }
+    final redacted = detections.map((d) {
+      if (d.details.keys.any(_redactedDetailKeys.contains)) {
+        final clean = {...d.details}
+          ..removeWhere((k, _) => _redactedDetailKeys.contains(k));
+        return d.copyWith(details: clean);
+      }
+      return d;
+    }).toList();
+    await _ensureFreshSupabaseToken();
+    final error = await _supabaseRestClient.insertDetections(
+      config: _config.value,
+      secrets: _secrets.value,
+      detections: redacted,
+    );
+    if (error != null) {
+      _diagnostics.add('Acoustic event store: $error');
+    }
   }
 
   Future<void> _sendAlertForEvent(

@@ -26,9 +26,20 @@ class AcousticAnalyzer {
   Future<void>? _starting;
   bool _disposed = false;
 
+  /// Frames sent to the isolate but not yet acknowledged. Bounds the cross-port
+  /// queue so a stalled/slow isolate can never grow memory without limit — under
+  /// backlog we drop frames (the detectors tolerate gaps) instead of buffering.
+  int _outstanding = 0;
+  int _droppedFrames = 0;
+  static const int _maxOutstanding = 64; // ~4 s of 16 kHz / 1024-hop frames
+
   Stream<AcousticDetection> get detections => _detections.stream;
 
   bool get isRunning => _commandPort != null;
+
+  /// Total frames dropped due to backpressure since the last [start]. Surfaced
+  /// for diagnostics.
+  int get droppedFrames => _droppedFrames;
 
   Future<void> start({
     required int sampleRate,
@@ -40,6 +51,8 @@ class AcousticAnalyzer {
       return;
     }
     await stop();
+    _outstanding = 0;
+    _droppedFrames = 0;
     _slicer = FrameSlicer(fftSize: fftSize, sampleRate: sampleRate);
     final ready = Completer<SendPort>();
     final receivePort = ReceivePort();
@@ -49,16 +62,21 @@ class AcousticAnalyzer {
         ready.complete(message);
         return;
       }
-      if (message is List && message.isNotEmpty && message[0] == 'detections') {
-        final rows = message[1] as List;
-        for (final row in rows) {
-          if (_detections.isClosed) {
-            break;
+      if (message is! List || message.isEmpty) {
+        return;
+      }
+      switch (message[0]) {
+        case 'result':
+          // One frame finished (with or without detections); free a slot.
+          if (_outstanding > 0) {
+            _outstanding -= 1;
           }
-          _detections.add(
-            AcousticDetection.fromJson((row as Map).cast<String, dynamic>()),
-          );
-        }
+          _emitRows(message[1] as List);
+          break;
+        case 'detections':
+          // Flush-time detections, not tied to an outstanding frame.
+          _emitRows(message[1] as List);
+          break;
       }
     });
     final starting = Isolate.spawn(_analyzerEntryPoint, {
@@ -84,12 +102,37 @@ class AcousticAnalyzer {
       return;
     }
     for (final framed in slicer.add(samples, chunkStartUtc)) {
+      if (_outstanding >= _maxOutstanding) {
+        // Isolate is behind; drop this frame rather than grow the queue. The
+        // slicer has already advanced, so later frames keep correct timestamps.
+        _droppedFrames += 1;
+        continue;
+      }
+      _outstanding += 1;
       port.send([
         'frame',
         framed.frame,
         framed.atUtc.toUtc().microsecondsSinceEpoch,
       ]);
     }
+  }
+
+  void _emitRows(List rows) {
+    for (final row in rows) {
+      if (_detections.isClosed) {
+        break;
+      }
+      _detections.add(
+        AcousticDetection.fromJson((row as Map).cast<String, dynamic>()),
+      );
+    }
+  }
+
+  /// Drops any buffered partial frame so the frame timeline re-anchors to the
+  /// next chunk. Call when feeding resumes after a gap (the loudness gate
+  /// reopening), so frames are not mis-timestamped against a stale anchor.
+  void resyncFeed() {
+    _slicer?.reset();
   }
 
   /// Asks the isolate to close any open episode (e.g. when the loudness gate
@@ -112,6 +155,7 @@ class AcousticAnalyzer {
     _slicer?.reset();
     _slicer = null;
     _starting = null;
+    _outstanding = 0;
   }
 
   Future<void> dispose() async {
@@ -139,20 +183,32 @@ void _analyzerEntryPoint(Map<String, dynamic> args) {
     }
     switch (message[0]) {
       case 'frame':
-        final frame = message[1] as Float64List;
-        final atUtc = DateTime.fromMicrosecondsSinceEpoch(
-          message[2] as int,
-          isUtc: true,
-        );
-        final detections = pipeline.process(frame, atUtc);
-        if (detections.isNotEmpty) {
-          reply.send(['detections', detections.map((d) => d.toJson()).toList()]);
+        var rows = const <Map<String, dynamic>>[];
+        try {
+          final frame = message[1] as Float64List;
+          final atUtc = DateTime.fromMicrosecondsSinceEpoch(
+            message[2] as int,
+            isUtc: true,
+          );
+          rows = pipeline.process(frame, atUtc).map((d) => d.toJson()).toList();
+        } catch (_) {
+          // One bad frame must not kill the analysis loop; skip it.
+          rows = const [];
         }
+        // Always reply so the main isolate's backpressure counter is balanced,
+        // even when a frame produced nothing or threw.
+        reply.send(['result', rows]);
         break;
       case 'flush':
-        final detections = pipeline.flush();
-        if (detections.isNotEmpty) {
-          reply.send(['detections', detections.map((d) => d.toJson()).toList()]);
+        try {
+          final detections = pipeline.flush();
+          if (detections.isNotEmpty) {
+            reply.send(
+              ['detections', detections.map((d) => d.toJson()).toList()],
+            );
+          }
+        } catch (_) {
+          // Ignore; nothing to flush.
         }
         break;
       case 'stop':

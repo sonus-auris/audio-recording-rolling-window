@@ -29,9 +29,28 @@ class AppConfig {
     this.autoGain = true,
     this.noiseSuppress = true,
     this.verbalCuesEnabled = false,
+    this.locationTaggingEnabled = false,
+    this.soundCloudDailyArchive = false,
+    this.spotifyAutoPlaylist = false,
+    this.placeNamesEnabled = false,
     this.pauseUploadsOnLowBattery = true,
     this.lowBatteryThresholdPercent = 20,
     this.uploadNetworkPolicy = UploadNetworkPolicy.any,
+    this.acousticAnalysisEnabled = false,
+    this.analysisActivationDb = -40.0,
+    this.analysisSustainSeconds = 2.0,
+    this.analysisHoldSeconds = 45.0,
+    this.snoreDetectionEnabled = true,
+    this.musicDetectionEnabled = true,
+    this.speechDetectionEnabled = true,
+    this.shazamEnabled = false,
+    this.keywords = const [],
+    this.sttEnabled = false,
+    this.sttEndpoint = '',
+    this.adaptiveQualityEnabled = false,
+    this.captureSampleRate = 48000,
+    this.quietSampleRate = 16000,
+    this.adaptiveLoudnessDb = -40.0,
   });
 
   /// Capture intents understood by both the app and the backend. Music turns off
@@ -92,6 +111,25 @@ class AppConfig {
   /// Speak short confirmations ("recording", "saved") while capturing.
   final bool verbalCuesEnabled;
 
+  /// Opt-in GPS evidence tagging: stamp each segment with the capture location
+  /// so a clip can prove where it was recorded. Off by default; requires the
+  /// user to grant location permission.
+  final bool locationTaggingEnabled;
+
+  /// When SoundCloud is linked and this is on, each day is published to the
+  /// user's SoundCloud as a private "Day of My Life" track (24h + AI notes),
+  /// keeping a rolling last-100-days window. Off by default.
+  final bool soundCloudDailyArchive;
+
+  /// When Spotify is linked and this is on, songs recognised in a saved clip are
+  /// added to a private "Sonus Auris Memories" playlist. Off by default.
+  final bool spotifyAutoPlaylist;
+
+  /// When on, "Drive" notes in a Day of My Life are enriched with a place name
+  /// via reverse geocoding. This sends coordinates to the platform geocoder, so
+  /// it is opt-in and off by default. Requires [locationTaggingEnabled].
+  final bool placeNamesEnabled;
+
   /// When true, pause cloud uploads while the battery is below
   /// [lowBatteryThresholdPercent] and the device is not charging. Local capture
   /// of the rolling window is never affected — deferred segments stay on device
@@ -105,7 +143,85 @@ class AppConfig {
   /// Which network transports uploads may use. Local capture is unaffected.
   final UploadNetworkPolicy uploadNetworkPolicy;
 
+  /// Master switch for the on-device FFT acoustic-intelligence engine. When off,
+  /// no spectral analysis runs and nothing is fed to the analyzer isolate.
+  final bool acousticAnalysisEnabled;
+
+  /// The analysis engine stays idle until the input is sustained at or above
+  /// [analysisActivationDb] (dBFS) for [analysisSustainSeconds]. This is the
+  /// "kick in once decibels get consistently high" gate.
+  final double analysisActivationDb;
+  final double analysisSustainSeconds;
+
+  /// Once active, the engine keeps analyzing through quiet stretches for this
+  /// long before going idle again, so gaps between snores (and apnea pauses)
+  /// are observed rather than missed.
+  final double analysisHoldSeconds;
+
+  /// Per-detector toggles for the analysis engine.
+  final bool snoreDetectionEnabled;
+  final bool musicDetectionEnabled;
+  final bool speechDetectionEnabled;
+
+  /// When a music detection fires on iOS, identify the song with ShazamKit.
+  /// No-op on Android. Sends a short audio fingerprint to Apple's service.
+  final bool shazamEnabled;
+
+  /// Keywords to watch for in transcribed speech (case-insensitive). A match
+  /// raises a magic-phrase alert. Only consulted when [sttEnabled].
+  final List<String> keywords;
+
+  /// Opt-in cloud speech-to-text. When on, short clips of sustained speech are
+  /// POSTed to [sttEndpoint] to scan for [keywords]. Off by default; audio only
+  /// leaves the device while this is enabled.
+  final bool sttEnabled;
+  final String sttEndpoint;
+
+  /// Adaptive recording quality: capture at [captureSampleRate] always (so the
+  /// FFT engine and sample continuity are preserved) but store *quiet* segments
+  /// downsampled to [quietSampleRate]. Loud segments keep full quality. A
+  /// segment is "loud" when its trailing RMS is at or above [adaptiveLoudnessDb].
+  final bool adaptiveQualityEnabled;
+  final int captureSampleRate;
+  final int quietSampleRate;
+  final double adaptiveLoudnessDb;
+
   bool get isMusic => useCase == 'music';
+
+  /// The sample rate the microphone stream actually opens at. Adaptive quality
+  /// forces the high [captureSampleRate]; otherwise the plain [sampleRate].
+  int get effectiveCaptureSampleRate =>
+      adaptiveQualityEnabled ? captureSampleRate : sampleRate;
+
+  /// Integer decimation factor from the capture rate down to ~16 kHz analysis.
+  int get analyzerDecimationFactor {
+    final ratio = (effectiveCaptureSampleRate / 16000).round();
+    return ratio < 1 ? 1 : ratio;
+  }
+
+  /// Actual sample rate the analyzer sees after decimation.
+  int get analyzerSampleRate =>
+      effectiveCaptureSampleRate ~/ analyzerDecimationFactor;
+
+  /// FFT window size used by the analysis engine.
+  int get analyzerFftSize => 2048;
+
+  /// Whether any spectral analysis should run at all.
+  bool get hasAcousticAnalysis =>
+      acousticAnalysisEnabled &&
+      (snoreDetectionEnabled ||
+          musicDetectionEnabled ||
+          speechDetectionEnabled);
+
+  /// Samples per segment / overlap at an arbitrary capture rate (the recorder
+  /// runs at [effectiveCaptureSampleRate], which may differ from [sampleRate]).
+  int samplesPerSegmentAt(int rate) =>
+      rate * segmentDuration.inSeconds.clamp(1, 86400);
+
+  int overlapSamplesAt(int rate) {
+    final requested = rate * overlapSeconds.clamp(0, 30);
+    return requested.clamp(0, samplesPerSegmentAt(rate) ~/ 2);
+  }
 
   bool get hasToneAdjustment =>
       bassGainDb != 0.0 || midGainDb != 0.0 || trebleGainDb != 0.0;
@@ -176,9 +292,28 @@ class AppConfig {
     bool? autoGain,
     bool? noiseSuppress,
     bool? verbalCuesEnabled,
+    bool? locationTaggingEnabled,
+    bool? soundCloudDailyArchive,
+    bool? spotifyAutoPlaylist,
+    bool? placeNamesEnabled,
     bool? pauseUploadsOnLowBattery,
     int? lowBatteryThresholdPercent,
     UploadNetworkPolicy? uploadNetworkPolicy,
+    bool? acousticAnalysisEnabled,
+    double? analysisActivationDb,
+    double? analysisSustainSeconds,
+    double? analysisHoldSeconds,
+    bool? snoreDetectionEnabled,
+    bool? musicDetectionEnabled,
+    bool? speechDetectionEnabled,
+    bool? shazamEnabled,
+    List<String>? keywords,
+    bool? sttEnabled,
+    String? sttEndpoint,
+    bool? adaptiveQualityEnabled,
+    int? captureSampleRate,
+    int? quietSampleRate,
+    double? adaptiveLoudnessDb,
   }) {
     return AppConfig(
       deviceId: deviceId ?? this.deviceId,
@@ -208,11 +343,38 @@ class AppConfig {
       autoGain: autoGain ?? this.autoGain,
       noiseSuppress: noiseSuppress ?? this.noiseSuppress,
       verbalCuesEnabled: verbalCuesEnabled ?? this.verbalCuesEnabled,
+      locationTaggingEnabled:
+          locationTaggingEnabled ?? this.locationTaggingEnabled,
+      soundCloudDailyArchive:
+          soundCloudDailyArchive ?? this.soundCloudDailyArchive,
+      spotifyAutoPlaylist: spotifyAutoPlaylist ?? this.spotifyAutoPlaylist,
+      placeNamesEnabled: placeNamesEnabled ?? this.placeNamesEnabled,
       pauseUploadsOnLowBattery:
           pauseUploadsOnLowBattery ?? this.pauseUploadsOnLowBattery,
       lowBatteryThresholdPercent:
           lowBatteryThresholdPercent ?? this.lowBatteryThresholdPercent,
       uploadNetworkPolicy: uploadNetworkPolicy ?? this.uploadNetworkPolicy,
+      acousticAnalysisEnabled:
+          acousticAnalysisEnabled ?? this.acousticAnalysisEnabled,
+      analysisActivationDb: analysisActivationDb ?? this.analysisActivationDb,
+      analysisSustainSeconds:
+          analysisSustainSeconds ?? this.analysisSustainSeconds,
+      analysisHoldSeconds: analysisHoldSeconds ?? this.analysisHoldSeconds,
+      snoreDetectionEnabled:
+          snoreDetectionEnabled ?? this.snoreDetectionEnabled,
+      musicDetectionEnabled:
+          musicDetectionEnabled ?? this.musicDetectionEnabled,
+      speechDetectionEnabled:
+          speechDetectionEnabled ?? this.speechDetectionEnabled,
+      shazamEnabled: shazamEnabled ?? this.shazamEnabled,
+      keywords: keywords ?? this.keywords,
+      sttEnabled: sttEnabled ?? this.sttEnabled,
+      sttEndpoint: sttEndpoint ?? this.sttEndpoint,
+      adaptiveQualityEnabled:
+          adaptiveQualityEnabled ?? this.adaptiveQualityEnabled,
+      captureSampleRate: captureSampleRate ?? this.captureSampleRate,
+      quietSampleRate: quietSampleRate ?? this.quietSampleRate,
+      adaptiveLoudnessDb: adaptiveLoudnessDb ?? this.adaptiveLoudnessDb,
     );
   }
 
@@ -244,9 +406,28 @@ class AppConfig {
       'autoGain': autoGain,
       'noiseSuppress': noiseSuppress,
       'verbalCuesEnabled': verbalCuesEnabled,
+      'locationTaggingEnabled': locationTaggingEnabled,
+      'soundCloudDailyArchive': soundCloudDailyArchive,
+      'spotifyAutoPlaylist': spotifyAutoPlaylist,
+      'placeNamesEnabled': placeNamesEnabled,
       'pauseUploadsOnLowBattery': pauseUploadsOnLowBattery,
       'lowBatteryThresholdPercent': lowBatteryThresholdPercent,
       'uploadNetworkPolicy': uploadNetworkPolicy.wireName,
+      'acousticAnalysisEnabled': acousticAnalysisEnabled,
+      'analysisActivationDb': analysisActivationDb,
+      'analysisSustainSeconds': analysisSustainSeconds,
+      'analysisHoldSeconds': analysisHoldSeconds,
+      'snoreDetectionEnabled': snoreDetectionEnabled,
+      'musicDetectionEnabled': musicDetectionEnabled,
+      'speechDetectionEnabled': speechDetectionEnabled,
+      'shazamEnabled': shazamEnabled,
+      'keywords': keywords,
+      'sttEnabled': sttEnabled,
+      'sttEndpoint': sttEndpoint,
+      'adaptiveQualityEnabled': adaptiveQualityEnabled,
+      'captureSampleRate': captureSampleRate,
+      'quietSampleRate': quietSampleRate,
+      'adaptiveLoudnessDb': adaptiveLoudnessDb,
     };
   }
 
@@ -282,6 +463,10 @@ class AppConfig {
       autoGain: json['autoGain'] as bool? ?? true,
       noiseSuppress: json['noiseSuppress'] as bool? ?? true,
       verbalCuesEnabled: json['verbalCuesEnabled'] as bool? ?? false,
+      locationTaggingEnabled: json['locationTaggingEnabled'] as bool? ?? false,
+      soundCloudDailyArchive: json['soundCloudDailyArchive'] as bool? ?? false,
+      spotifyAutoPlaylist: json['spotifyAutoPlaylist'] as bool? ?? false,
+      placeNamesEnabled: json['placeNamesEnabled'] as bool? ?? false,
       pauseUploadsOnLowBattery:
           json['pauseUploadsOnLowBattery'] as bool? ?? true,
       lowBatteryThresholdPercent: _asInt(
@@ -291,7 +476,39 @@ class AppConfig {
       uploadNetworkPolicy: UploadNetworkPolicy.fromName(
         json['uploadNetworkPolicy'] as String?,
       ),
+      acousticAnalysisEnabled:
+          json['acousticAnalysisEnabled'] as bool? ?? false,
+      analysisActivationDb: _asDouble(json['analysisActivationDb'], -40.0)
+          .clamp(-90.0, 0.0),
+      analysisSustainSeconds: _asDouble(json['analysisSustainSeconds'], 2.0)
+          .clamp(0.5, 30.0),
+      analysisHoldSeconds:
+          _asDouble(json['analysisHoldSeconds'], 45.0).clamp(0.0, 600.0),
+      snoreDetectionEnabled: json['snoreDetectionEnabled'] as bool? ?? true,
+      musicDetectionEnabled: json['musicDetectionEnabled'] as bool? ?? true,
+      speechDetectionEnabled: json['speechDetectionEnabled'] as bool? ?? true,
+      shazamEnabled: json['shazamEnabled'] as bool? ?? false,
+      keywords: _asStringList(json['keywords']),
+      sttEnabled: json['sttEnabled'] as bool? ?? false,
+      sttEndpoint: json['sttEndpoint'] as String? ?? '',
+      adaptiveQualityEnabled: json['adaptiveQualityEnabled'] as bool? ?? false,
+      captureSampleRate:
+          _asInt(json['captureSampleRate'], 48000).clamp(8000, 48000),
+      quietSampleRate:
+          _asInt(json['quietSampleRate'], 16000).clamp(8000, 48000),
+      adaptiveLoudnessDb:
+          _asDouble(json['adaptiveLoudnessDb'], -40.0).clamp(-90.0, 0.0),
     );
+  }
+
+  static List<String> _asStringList(Object? value) {
+    if (value is List) {
+      return value
+          .map((e) => e.toString().trim())
+          .where((e) => e.isNotEmpty)
+          .toList();
+    }
+    return const [];
   }
 
   static int _asInt(Object? value, int fallback) {

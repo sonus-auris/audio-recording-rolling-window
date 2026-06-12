@@ -9,6 +9,7 @@ import '../models/app_config.dart';
 import '../models/cloud_provider.dart';
 import '../models/cloud_secrets.dart';
 import '../models/recording_segment.dart';
+import 'crypto/segment_encryptor.dart';
 
 class BackendUploadSession {
   const BackendUploadSession({
@@ -87,10 +88,17 @@ class SoundRecorderBackendClient {
   SoundRecorderBackendClient({
     http.Client? httpClient,
     this.requestTimeout = const Duration(seconds: 45),
-  }) : _httpClient = httpClient ?? http.Client();
+    SegmentEncryptor? encryptor,
+  })  : _httpClient = httpClient ?? http.Client(),
+        _encryptor = encryptor;
 
   final http.Client _httpClient;
   final Duration requestTimeout;
+
+  /// When set, every segment is sealed on-device before upload so the cloud and
+  /// our backend only ever store ciphertext. The presign/complete hash and byte
+  /// count are computed over the ciphertext that is actually PUT.
+  final SegmentEncryptor? _encryptor;
 
   Future<BackendUploadSession> createUploadSession({
     required AppConfig config,
@@ -146,7 +154,12 @@ class SoundRecorderBackendClient {
       );
     }
     try {
-      final bytes = await file.readAsBytes();
+      final plaintext = await file.readAsBytes();
+      // Seal on-device before anything leaves the phone. The hash, byte count,
+      // and PUT body below all operate on the ciphertext the cloud stores.
+      final bytes = _encryptor == null
+          ? plaintext
+          : await _encryptor.seal(plaintext);
       final sha256Hex = sha256.convert(bytes).toString();
       final presignUri = _apiUri(
         config,
@@ -172,6 +185,7 @@ class SoundRecorderBackendClient {
                 'overlapSamples': segment.overlapSamples,
                 'sampleRate': segment.sampleRate,
                 'channels': segment.channels,
+                if (segment.geoTag != null) 'geo': segment.geoTag!.toJson(),
               },
             }),
           )
@@ -318,6 +332,8 @@ class SoundRecorderBackendClient {
                         'overlapSamples': segment.overlapSamples,
                         'sampleRate': segment.sampleRate,
                         'channels': segment.channels,
+                        if (segment.geoTag != null)
+                          'geo': segment.geoTag!.toJson(),
                       },
                     },
                   )
