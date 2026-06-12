@@ -1,3 +1,5 @@
+import 'geo_tag.dart';
+
 enum SegmentUploadStatus {
   pending,
   uploading,
@@ -37,6 +39,7 @@ class RecordingSegment {
     this.permanentSavedAtUtc,
     this.permanentError,
     this.error,
+    this.geoTag,
   });
 
   final String id;
@@ -61,6 +64,10 @@ class RecordingSegment {
   final DateTime? permanentSavedAtUtc;
   final String? permanentError;
   final String? error;
+
+  /// Optional capture-location evidence (null unless location tagging is on and
+  /// a fix was available). See [GeoTag].
+  final GeoTag? geoTag;
 
   Duration get duration => endedAtUtc.difference(startedAtUtc);
 
@@ -140,6 +147,7 @@ class RecordingSegment {
     Object? permanentSavedAtUtc = _unset,
     Object? permanentError = _unset,
     Object? error = _unset,
+    Object? geoTag = _unset,
   }) {
     return RecordingSegment(
       id: id ?? this.id,
@@ -176,6 +184,7 @@ class RecordingSegment {
           ? this.permanentError
           : permanentError as String?,
       error: identical(error, _unset) ? this.error : error as String?,
+      geoTag: identical(geoTag, _unset) ? this.geoTag : geoTag as GeoTag?,
     );
   }
 
@@ -203,6 +212,7 @@ class RecordingSegment {
       'permanentSavedAtUtc': permanentSavedAtUtc?.toIso8601String(),
       'permanentError': permanentError,
       'error': error,
+      'geoTag': geoTag?.toJson(),
     };
   }
 
@@ -236,6 +246,9 @@ class RecordingSegment {
           : DateTime.parse(json['permanentSavedAtUtc'] as String).toUtc(),
       permanentError: json['permanentError'] as String?,
       error: json['error'] as String?,
+      geoTag: json['geoTag'] is Map<String, dynamic>
+          ? GeoTag.fromJson(json['geoTag'] as Map<String, dynamic>)
+          : null,
     );
   }
 

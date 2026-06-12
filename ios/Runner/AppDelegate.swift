@@ -15,5 +15,9 @@ import UIKit
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "IcloudBridge") {
       IcloudBridge.register(messenger: registrar.messenger())
     }
+    if #available(iOS 15.0, *),
+       let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ShazamBridge") {
+      ShazamBridge.register(messenger: registrar.messenger())
+    }
   }
 }

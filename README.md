@@ -57,6 +57,81 @@ Use a bucket/prefix scoped principal. The app needs:
 
 If a later cloud playback browser needs listing, add `s3:ListBucket` scoped to the app prefix.
 
+## Acoustic Intelligence (on-device FFT)
+
+An optional frequency-domain engine runs alongside capture. It is **off by
+default** (enable it under Configure → Acoustic Intelligence) and, when on, stays
+idle until the input is sustained at or above an activation level (dBFS) for a
+few seconds — the "kick in once decibels get consistently high" gate. Once
+active it keeps analyzing through quiet stretches for a hold window so gaps
+between sounds are observed, then goes idle again.
+
+- Analysis runs on a background isolate (`AcousticAnalyzer`) so the capture path
+  never blocks. The recorder decimates the processed stream to ~16 kHz mono and
+  feeds 2048-point Hann-windowed FFT frames (50% overlap). FFT uses `fftea`.
+- Detectors (all pure/unit-tested in `lib/src/services/acoustic/`):
+  - **Snoring** — sustained low-centroid bursts with strong 60–300 Hz energy.
+  - **Possible apnea pattern** — a run of regular snores interrupted by a long
+    cessation (>~10 s) that then resumes. **This is a non-diagnostic acoustic
+    heuristic, not a medical diagnosis or a medical device.**
+  - **Music** — sustained pitched/harmonic content with a steady beat (tempo
+    from the loudness-envelope autocorrelation).
+  - **Speech** — voiced-band (300–3400 Hz) dominance with 3–8 Hz syllabic
+    modulation.
+- **Song identification (ShazamKit, iOS only):** when music is detected and the
+  user enables it, a short clip is matched with Apple's ShazamKit via the
+  `audio_dashcam/shazam` platform channel. Requires the ShazamKit capability on
+  the App ID (see entitlements). On Android the event still says "music
+  detected" but carries no title. Only a derived audio signature is sent.
+- **Keywords (opt-in cloud speech-to-text):** when speech is detected, STT is
+  enabled, and keywords are configured, the recent clip is POSTed as WAV to a
+  user-configured endpoint (`sttEndpoint` + secret `sttApiKey`). A keyword hit
+  records a `keyword` event and raises the existing magic-phrase alert/email.
+  Audio leaves the device only while STT is enabled.
+- On-device FFT detection alone sends nothing externally. Detections are
+  surfaced on the Home screen and synced to Supabase (below).
+
+## Adaptive Recording Quality
+
+When enabled, the microphone always opens at the high `captureSampleRate` (so the
+FFT engine and sample-continuous timeline are preserved), but each one-minute
+segment is stored at full quality only when its trailing loudness is at or above
+the loud/quiet threshold; quiet segments are anti-aliased and decimated to
+`quietSampleRate` before being written. Stored rate is per-segment
+(`RecordingSegment.sampleRate`), and wall-clock segment timestamps stay
+authoritative, so playback and ranges are unaffected.
+
+## Supabase Schema (acoustic_events)
+
+Detection events are user data and are written to Supabase via PostgREST using
+the signed-in user's access token (never a service key); row-level security
+scopes every row to that user. The audio files themselves still go to S3 /
+Google Drive / the backend as before. Create the table once:
+
+```sql
+create table public.acoustic_events (
+  id          bigint generated always as identity primary key,
+  user_id     uuid not null default auth.uid() references auth.users (id),
+  device_id   text not null,
+  kind        text not null,
+  started_at  timestamptz not null,
+  ended_at    timestamptz not null,
+  confidence  double precision not null default 0,
+  details     jsonb not null default '{}'::jsonb,
+  created_at  timestamptz not null default now()
+);
+
+alter table public.acoustic_events enable row level security;
+
+create policy "own rows: insert" on public.acoustic_events
+  for insert with check (user_id = auth.uid());
+create policy "own rows: select" on public.acoustic_events
+  for select using (user_id = auth.uid());
+```
+
+The client sends `device_id, kind, started_at, ended_at, confidence, details`;
+`user_id` defaults to `auth.uid()` server-side.
+
 ## Development
 
 Flutter was installed locally at:

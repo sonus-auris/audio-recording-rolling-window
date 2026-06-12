@@ -24,8 +24,11 @@ class RecordingFeedback {
     }
   }
 
-  Future<void> say(String phrase) async {
-    if (!enabled) {
+  /// Speaks [phrase]. Ambient cues are gated by [enabled]; pass [force] for a
+  /// direct confirmation of a deliberate user action (quality switch, restart)
+  /// so it is heard even when ambient verbal cues are turned off.
+  Future<void> say(String phrase, {bool force = false}) async {
+    if (!enabled && !force) {
       return;
     }
     try {

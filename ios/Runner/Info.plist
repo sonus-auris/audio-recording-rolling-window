@@ -26,8 +26,17 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- Make the secure default explicit and audit-proof: no plaintext HTTP,
+		     no per-domain exceptions. All backend / S3 / OAuth traffic is HTTPS. -->
+		<key>NSAllowsArbitraryLoads</key>
+		<false/>
+	</dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Audio Dashcam records a rolling audio window only after you start capture.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Sonus Auris can tag recordings with their location so a clip can prove where it was captured. Location tagging is optional and off by default.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

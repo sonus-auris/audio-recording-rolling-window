@@ -6,12 +6,15 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'src/app/app_controller.dart';
 import 'src/app/app_view_model.dart';
+import 'src/models/acoustic_detection.dart';
 import 'src/models/app_config.dart';
 import 'src/models/cloud_connection.dart';
 import 'src/models/cloud_provider.dart';
 import 'src/models/storage_estimate.dart';
 import 'src/models/transfer_gate_status.dart';
 import 'src/models/upload_network_policy.dart';
+import 'src/theme/sonus_brand.dart';
+import 'src/theme/sonus_theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -47,42 +50,9 @@ class _AudioDashcamRootState extends State<AudioDashcamRoot> {
   Widget build(BuildContext context) {
     return WithForegroundTask(
       child: MaterialApp(
-        title: 'Audio Dashcam',
+        title: 'Sonus Auris',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: const Color(0xFF287C66),
-            brightness: Brightness.light,
-          ),
-          scaffoldBackgroundColor: const Color(0xFFF6F8F7),
-          useMaterial3: true,
-          appBarTheme: const AppBarTheme(
-            centerTitle: false,
-            elevation: 0,
-            scrolledUnderElevation: 0,
-          ),
-          inputDecorationTheme: const InputDecorationTheme(
-            border: OutlineInputBorder(),
-            isDense: true,
-          ),
-          filledButtonTheme: FilledButtonThemeData(
-            style: FilledButton.styleFrom(
-              minimumSize: const Size(0, 44),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-            ),
-          ),
-          outlinedButtonTheme: OutlinedButtonThemeData(
-            style: OutlinedButton.styleFrom(
-              minimumSize: const Size(0, 44),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-            ),
-          ),
-          cardTheme: const CardThemeData(margin: EdgeInsets.zero, elevation: 0),
-        ),
+        theme: buildSonusTheme(),
         home: FutureBuilder<void>(
           future: _initFuture,
           builder: (context, snapshot) {
@@ -105,7 +75,34 @@ class LoadingPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    return const Scaffold(
+      backgroundColor: SonusColors.paper,
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SonusLogoMark(size: 64),
+            SizedBox(height: 22),
+            Text(
+              'Sonus Auris',
+              style: TextStyle(
+                fontFamily: kSonusFontFamily,
+                color: SonusColors.ink,
+                fontWeight: FontWeight.w800,
+                fontSize: 22,
+                letterSpacing: -0.3,
+              ),
+            ),
+            SizedBox(height: 18),
+            SizedBox(
+              width: 26,
+              height: 26,
+              child: CircularProgressIndicator(strokeWidth: 3),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -117,7 +114,7 @@ class ErrorPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Audio Dashcam')),
+      appBar: AppBar(title: const SonusWordmark()),
       body: Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -156,6 +153,7 @@ class _SettingsPageState extends State<SettingsPage> {
   final _s3SessionTokenController = TextEditingController();
   final _supabaseUrlController = TextEditingController();
   final _supabaseAnonKeyController = TextEditingController();
+  final _sttApiKeyController = TextEditingController();
 
   String? _syncedDeviceId;
   CloudProvider _selectedProvider = CloudProvider.s3;
@@ -182,6 +180,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _s3SessionTokenController,
       _supabaseUrlController,
       _supabaseAnonKeyController,
+      _sttApiKeyController,
     ]) {
       controller.dispose();
     }
@@ -200,7 +199,8 @@ class _SettingsPageState extends State<SettingsPage> {
         _syncForm(viewModel);
         return Scaffold(
           appBar: AppBar(
-            title: const Text('Audio Dashcam'),
+            titleSpacing: 16,
+            title: const SonusWordmark(),
             actions: [
               IconButton(
                 tooltip: 'Retry uploads',
@@ -315,6 +315,7 @@ class _SettingsPageState extends State<SettingsPage> {
             s3AccessKeyController: _s3AccessKeyController,
             s3SecretKeyController: _s3SecretKeyController,
             s3SessionTokenController: _s3SessionTokenController,
+            sttApiKeyController: _sttApiKeyController,
           ),
         );
       default:
@@ -322,6 +323,8 @@ class _SettingsPageState extends State<SettingsPage> {
           viewModel: viewModel,
           onStart: widget.controller.startRecording,
           onStop: widget.controller.stopRecording,
+          onRestart: widget.controller.restartRecording,
+          onToggleHighQuality: widget.controller.toggleHighQualityRecording,
           onSendAlert: widget.controller.sendManualAlert,
           onConfirm: widget.controller.confirmRecording,
         );
@@ -351,6 +354,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _s3SessionTokenController.text = secrets.s3SessionToken;
     _supabaseUrlController.text = config.supabaseUrl;
     _supabaseAnonKeyController.text = config.supabaseAnonKey;
+    _sttApiKeyController.text = secrets.sttApiKey;
     _selectedProvider = config.cloudProvider;
     _uploadEnabled = config.uploadEnabled;
     _syncedDeviceId = config.deviceId;
@@ -384,6 +388,7 @@ class _SettingsPageState extends State<SettingsPage> {
       s3SecretAccessKey: _s3SecretKeyController.text,
       s3SessionToken: _s3SessionTokenController.text,
       backendDeviceToken: _backendDeviceTokenController.text,
+      sttApiKey: _sttApiKeyController.text,
     );
     await widget.controller.saveConfig(config);
     await widget.controller.saveSecrets(secrets);
@@ -433,6 +438,8 @@ class _HomeView extends StatelessWidget {
     required this.viewModel,
     required this.onStart,
     required this.onStop,
+    required this.onRestart,
+    required this.onToggleHighQuality,
     required this.onSendAlert,
     required this.onConfirm,
   });
@@ -440,6 +447,8 @@ class _HomeView extends StatelessWidget {
   final AppViewModel viewModel;
   final VoidCallback onStart;
   final VoidCallback onStop;
+  final VoidCallback onRestart;
+  final VoidCallback onToggleHighQuality;
   final VoidCallback onSendAlert;
   final VoidCallback onConfirm;
 
@@ -456,20 +465,34 @@ class _HomeView extends StatelessWidget {
           viewModel: viewModel,
           onStart: onStart,
           onStop: onStop,
+          onRestart: onRestart,
+          onToggleHighQuality: onToggleHighQuality,
           onSendAlert: onSendAlert,
         ),
         if (viewModel.isUploadGatePaused) ...[
           const SizedBox(height: 12),
-          Card(
-            color: Theme.of(context).colorScheme.errorContainer,
+          Container(
+            decoration: BoxDecoration(
+              color: SonusColors.orange200.withValues(alpha: 0.45),
+              border: Border.all(color: SonusColors.orange400),
+              borderRadius: BorderRadius.circular(20),
+            ),
             child: ListTile(
-              leading: const Icon(Icons.cloud_off),
+              leading: const Icon(
+                Icons.cloud_off,
+                color: SonusColors.orange600,
+              ),
               title: Text(
                 '${viewModel.pendingUploads} segment(s) waiting to upload',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w800,
+                  color: SonusColors.ink,
+                ),
               ),
               subtitle: Text(
                 viewModel.transferStatus.detail ??
                     'Uploads are paused. Recording continues on device.',
+                style: const TextStyle(color: SonusColors.inkSoft),
               ),
             ),
           ),
@@ -480,9 +503,81 @@ class _HomeView extends StatelessWidget {
           icon: const Icon(Icons.verified_outlined),
           label: const Text("Confirm it's working"),
         ),
+        if (viewModel.config.acousticAnalysisEnabled) ...[
+          const SizedBox(height: 16),
+          _DetectionsSection(detections: viewModel.detections),
+        ],
         const SizedBox(height: 16),
         _DiagnosticsSection(entries: viewModel.diagnosticEntries),
       ],
+    );
+  }
+}
+
+/// Lists recent on-device acoustic detections (snoring, possible apnea patterns,
+/// music, speech, keywords). Newest first.
+class _DetectionsSection extends StatelessWidget {
+  const _DetectionsSection({required this.detections});
+
+  final List<AcousticDetection> detections;
+
+  IconData _icon(AcousticDetectionKind kind) {
+    switch (kind) {
+      case AcousticDetectionKind.snore:
+        return Icons.bedtime;
+      case AcousticDetectionKind.apneaPattern:
+        return Icons.warning_amber;
+      case AcousticDetectionKind.music:
+        return Icons.music_note;
+      case AcousticDetectionKind.speech:
+        return Icons.record_voice_over;
+      case AcousticDetectionKind.keyword:
+        return Icons.flag;
+    }
+  }
+
+  String _subtitle(AcousticDetection d) {
+    final time = d.startedAtUtc.toLocal().toString().split('.').first;
+    switch (d.kind) {
+      case AcousticDetectionKind.music:
+        final title = d.details['title'];
+        final artist = d.details['artist'];
+        if (title is String && title.isNotEmpty) {
+          return '$time · $title${artist is String && artist.isNotEmpty ? ' — $artist' : ''}';
+        }
+        return '$time · music detected';
+      case AcousticDetectionKind.keyword:
+        return '$time · "${d.details['keyword'] ?? ''}"';
+      case AcousticDetectionKind.apneaPattern:
+        return '$time · gap ${d.details['gapSeconds'] ?? '?'}s (not a diagnosis)';
+      default:
+        return time;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _Section(
+      title: 'Acoustic detections',
+      child: detections.isEmpty
+          ? const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text('No detections yet. The engine activates when sound '
+                  'is sustained.'),
+            )
+          : Column(
+              children: [
+                for (final d in detections.take(20))
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    leading: Icon(_icon(d.kind)),
+                    title: Text(d.kind.label),
+                    subtitle: Text(_subtitle(d)),
+                    trailing: Text('${(d.confidence * 100).round()}%'),
+                  ),
+              ],
+            ),
     );
   }
 }
@@ -802,6 +897,7 @@ class _ConfigureView extends StatelessWidget {
     required this.s3AccessKeyController,
     required this.s3SecretKeyController,
     required this.s3SessionTokenController,
+    required this.sttApiKeyController,
   });
 
   final AppViewModel viewModel;
@@ -828,6 +924,7 @@ class _ConfigureView extends StatelessWidget {
   final TextEditingController s3AccessKeyController;
   final TextEditingController s3SecretKeyController;
   final TextEditingController s3SessionTokenController;
+  final TextEditingController sttApiKeyController;
 
   @override
   Widget build(BuildContext context) {
@@ -894,6 +991,18 @@ class _ConfigureView extends StatelessWidget {
         _AudioTuningSection(
           config: viewModel.config,
           onChanged: onAudioConfigChanged,
+        ),
+        const SizedBox(height: 16),
+        _MusicMemoriesSection(
+          config: viewModel.config,
+          onChanged: onAudioConfigChanged,
+          controller: controller,
+        ),
+        const SizedBox(height: 16),
+        _AcousticSection(
+          config: viewModel.config,
+          onChanged: onAudioConfigChanged,
+          sttApiKeyController: sttApiKeyController,
         ),
         if (viewModel.isDeviceRegistered) ...[
           const SizedBox(height: 16),
@@ -1278,6 +1387,7 @@ class _AudioTuningSectionState extends State<_AudioTuningSection> {
   late bool _autoGain;
   late bool _noiseSuppress;
   late bool _verbalCues;
+  late bool _locationTagging;
 
   void _seed(AppConfig config) {
     _useCase = config.useCase;
@@ -1289,6 +1399,7 @@ class _AudioTuningSectionState extends State<_AudioTuningSection> {
     _autoGain = config.autoGain;
     _noiseSuppress = config.noiseSuppress;
     _verbalCues = config.verbalCuesEnabled;
+    _locationTagging = config.locationTaggingEnabled;
     _syncedDeviceId = config.deviceId;
   }
 
@@ -1304,6 +1415,7 @@ class _AudioTuningSectionState extends State<_AudioTuningSection> {
         autoGain: _autoGain,
         noiseSuppress: _noiseSuppress,
         verbalCuesEnabled: _verbalCues,
+        locationTaggingEnabled: _locationTagging,
       ),
     );
   }
@@ -1420,6 +1532,416 @@ class _AudioTuningSectionState extends State<_AudioTuningSection> {
               _apply();
             },
           ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Location evidence (GPS)'),
+            subtitle: const Text(
+              'Tag each clip with where it was recorded. Requires location '
+              'permission.',
+            ),
+            value: _locationTagging,
+            onChanged: (value) {
+              setState(() => _locationTagging = value);
+              _apply();
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _slider({
+    required String label,
+    required double value,
+    required double min,
+    required double max,
+    required int divisions,
+    required String display,
+    required ValueChanged<double> onChanged,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(label),
+              Text(display, style: Theme.of(context).textTheme.labelMedium),
+            ],
+          ),
+          Slider(
+            value: value.clamp(min, max),
+            min: min,
+            max: max,
+            divisions: divisions,
+            label: display,
+            onChanged: onChanged,
+            onChangeEnd: (_) => _apply(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// On-device acoustic intelligence: the FFT engine, its loudness gate, the
+/// Links the user's SoundCloud / Spotify and toggles the opt-in "memories"
+/// features: a daily "Day of My Life" SoundCloud archive and an auto-built
+/// private Spotify playlist of songs heard. Both are off until linked + enabled.
+class _MusicMemoriesSection extends StatefulWidget {
+  const _MusicMemoriesSection({
+    required this.config,
+    required this.onChanged,
+    required this.controller,
+  });
+
+  final AppConfig config;
+  final ValueChanged<AppConfig> onChanged;
+  final AppController controller;
+
+  @override
+  State<_MusicMemoriesSection> createState() => _MusicMemoriesSectionState();
+}
+
+class _MusicMemoriesSectionState extends State<_MusicMemoriesSection> {
+  bool _busy = false;
+
+  Future<void> _run(Future<void> Function() action) async {
+    setState(() => _busy = true);
+    try {
+      await action();
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scLinked = widget.controller.isSoundCloudLinked;
+    final spLinked = widget.controller.isSpotifyLinked;
+    return _Section(
+      title: 'Music memories',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // SoundCloud — Day of My Life
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('SoundCloud'),
+            subtitle: Text(scLinked ? 'Linked' : 'Not linked'),
+            trailing: TextButton(
+              onPressed: _busy
+                  ? null
+                  : () => _run(scLinked
+                      ? widget.controller.unlinkSoundCloud
+                      : widget.controller.linkSoundCloud),
+              child: Text(scLinked ? 'Unlink' : 'Link'),
+            ),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('“Day of My Life” daily archive'),
+            subtitle: const Text(
+              'Publish each day as a private 24-hour track with AI notes; keeps '
+              'the last 100 days. Leaves the encrypted vault — your choice.',
+            ),
+            value: widget.config.soundCloudDailyArchive,
+            onChanged: scLinked
+                ? (v) => widget.onChanged(
+                      widget.config.copyWith(soundCloudDailyArchive: v),
+                    )
+                : null,
+          ),
+          const Divider(),
+          // Spotify — memories playlist
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Spotify'),
+            subtitle: Text(spLinked ? 'Linked' : 'Not linked'),
+            trailing: TextButton(
+              onPressed: _busy
+                  ? null
+                  : () => _run(spLinked
+                      ? widget.controller.unlinkSpotify
+                      : widget.controller.linkSpotify),
+              child: Text(spLinked ? 'Unlink' : 'Link'),
+            ),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Auto-add songs to a private playlist'),
+            subtitle: const Text(
+              'Songs recognised on-device are added (de-duplicated) to a private '
+              '“Sonus Auris Memories” playlist.',
+            ),
+            value: widget.config.spotifyAutoPlaylist,
+            onChanged: spLinked
+                ? (v) => widget.onChanged(
+                      widget.config.copyWith(spotifyAutoPlaylist: v),
+                    )
+                : null,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// snore/apnea/music/speech detectors, optional ShazamKit + cloud STT, and
+/// adaptive recording quality. Detector/config toggles persist immediately via
+/// [onChanged]; the STT API key (a secret) is held in [sttApiKeyController] and
+/// saved with the main Save button.
+class _AcousticSection extends StatefulWidget {
+  const _AcousticSection({
+    required this.config,
+    required this.onChanged,
+    required this.sttApiKeyController,
+  });
+
+  final AppConfig config;
+  final ValueChanged<AppConfig> onChanged;
+  final TextEditingController sttApiKeyController;
+
+  @override
+  State<_AcousticSection> createState() => _AcousticSectionState();
+}
+
+class _AcousticSectionState extends State<_AcousticSection> {
+  static const _captureRates = [16000, 24000, 44100, 48000];
+  static const _quietRates = [8000, 16000, 22050];
+
+  String? _syncedDeviceId;
+  late bool _enabled;
+  late bool _snore;
+  late bool _music;
+  late bool _speech;
+  late bool _shazam;
+  late double _activationDb;
+  late bool _sttEnabled;
+  late bool _adaptiveEnabled;
+  late int _captureRate;
+  late int _quietRate;
+  late double _adaptiveLoudnessDb;
+  final _keywordsController = TextEditingController();
+  final _sttEndpointController = TextEditingController();
+
+  void _seed(AppConfig config) {
+    _enabled = config.acousticAnalysisEnabled;
+    _snore = config.snoreDetectionEnabled;
+    _music = config.musicDetectionEnabled;
+    _speech = config.speechDetectionEnabled;
+    _shazam = config.shazamEnabled;
+    _activationDb = config.analysisActivationDb;
+    _sttEnabled = config.sttEnabled;
+    _adaptiveEnabled = config.adaptiveQualityEnabled;
+    _captureRate = config.captureSampleRate;
+    _quietRate = config.quietSampleRate;
+    _adaptiveLoudnessDb = config.adaptiveLoudnessDb;
+    _keywordsController.text = config.keywords.join(', ');
+    _sttEndpointController.text = config.sttEndpoint;
+    _syncedDeviceId = config.deviceId;
+  }
+
+  @override
+  void dispose() {
+    _keywordsController.dispose();
+    _sttEndpointController.dispose();
+    super.dispose();
+  }
+
+  void _apply() {
+    final keywords = _keywordsController.text
+        .split(',')
+        .map((k) => k.trim())
+        .where((k) => k.isNotEmpty)
+        .toList();
+    widget.onChanged(
+      widget.config.copyWith(
+        acousticAnalysisEnabled: _enabled,
+        snoreDetectionEnabled: _snore,
+        musicDetectionEnabled: _music,
+        speechDetectionEnabled: _speech,
+        shazamEnabled: _shazam,
+        analysisActivationDb: _activationDb,
+        sttEnabled: _sttEnabled,
+        sttEndpoint: _sttEndpointController.text.trim(),
+        keywords: keywords,
+        adaptiveQualityEnabled: _adaptiveEnabled,
+        captureSampleRate: _captureRate,
+        quietSampleRate: _quietRate,
+        adaptiveLoudnessDb: _adaptiveLoudnessDb,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_syncedDeviceId != widget.config.deviceId) {
+      _seed(widget.config);
+    }
+    return _Section(
+      title: 'Acoustic Intelligence',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Enable acoustic analysis'),
+            subtitle: const Text(
+              'On-device FFT. Activates only when sound is sustained.',
+            ),
+            value: _enabled,
+            onChanged: (v) {
+              setState(() => _enabled = v);
+              _apply();
+            },
+          ),
+          if (_enabled) ...[
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Snoring / apnea patterns'),
+              subtitle: const Text('Non-diagnostic; not a medical device'),
+              value: _snore,
+              onChanged: (v) {
+                setState(() => _snore = v);
+                _apply();
+              },
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Music detection'),
+              value: _music,
+              onChanged: (v) {
+                setState(() => _music = v);
+                _apply();
+              },
+            ),
+            if (_music)
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Identify songs (ShazamKit, iOS only)'),
+                subtitle: const Text('Sends an audio fingerprint to Apple'),
+                value: _shazam,
+                onChanged: (v) {
+                  setState(() => _shazam = v);
+                  _apply();
+                },
+              ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Speech detection'),
+              value: _speech,
+              onChanged: (v) {
+                setState(() => _speech = v);
+                _apply();
+              },
+            ),
+            _slider(
+              label: 'Activation level',
+              value: _activationDb,
+              min: -90,
+              max: 0,
+              divisions: 90,
+              display: '${_activationDb.toStringAsFixed(0)} dB',
+              onChanged: (v) => setState(() => _activationDb = v),
+            ),
+            const Divider(),
+            Text('Keyword alerts (cloud speech-to-text)',
+                style: Theme.of(context).textTheme.titleSmall),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Transcribe speech for keywords'),
+              subtitle: const Text(
+                'Opt-in. Sends short clips to your STT endpoint.',
+              ),
+              value: _sttEnabled,
+              onChanged: (v) {
+                setState(() => _sttEnabled = v);
+                _apply();
+              },
+            ),
+            if (_sttEnabled) ...[
+              TextField(
+                controller: _keywordsController,
+                decoration: const InputDecoration(
+                  labelText: 'Keywords (comma-separated)',
+                ),
+                onEditingComplete: _apply,
+              ),
+              TextField(
+                controller: _sttEndpointController,
+                keyboardType: TextInputType.url,
+                decoration: const InputDecoration(
+                  labelText: 'STT endpoint URL',
+                ),
+                onEditingComplete: _apply,
+              ),
+              TextField(
+                controller: widget.sttApiKeyController,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'STT API key (saved with Save Configuration)',
+                ),
+              ),
+            ],
+            const Divider(),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Adaptive recording quality'),
+              subtitle: const Text(
+                'Capture high; store quiet stretches downsampled.',
+              ),
+              value: _adaptiveEnabled,
+              onChanged: (v) {
+                setState(() => _adaptiveEnabled = v);
+                _apply();
+              },
+            ),
+            if (_adaptiveEnabled) ...[
+              DropdownButtonFormField<int>(
+                initialValue: _captureRates.contains(_captureRate)
+                    ? _captureRate
+                    : 48000,
+                decoration:
+                    const InputDecoration(labelText: 'Loud capture rate'),
+                items: [
+                  for (final r in _captureRates)
+                    DropdownMenuItem(value: r, child: Text('$r Hz')),
+                ],
+                onChanged: (v) {
+                  if (v == null) return;
+                  setState(() => _captureRate = v);
+                  _apply();
+                },
+              ),
+              DropdownButtonFormField<int>(
+                initialValue:
+                    _quietRates.contains(_quietRate) ? _quietRate : 16000,
+                decoration:
+                    const InputDecoration(labelText: 'Quiet storage rate'),
+                items: [
+                  for (final r in _quietRates)
+                    DropdownMenuItem(value: r, child: Text('$r Hz')),
+                ],
+                onChanged: (v) {
+                  if (v == null) return;
+                  setState(() => _quietRate = v);
+                  _apply();
+                },
+              ),
+              _slider(
+                label: 'Loud/quiet threshold',
+                value: _adaptiveLoudnessDb,
+                min: -90,
+                max: 0,
+                divisions: 90,
+                display: '${_adaptiveLoudnessDb.toStringAsFixed(0)} dB',
+                onChanged: (v) => setState(() => _adaptiveLoudnessDb = v),
+              ),
+            ],
+          ],
         ],
       ),
     );
@@ -1757,12 +2279,16 @@ class _StatusSection extends StatelessWidget {
     required this.viewModel,
     required this.onStart,
     required this.onStop,
+    required this.onRestart,
+    required this.onToggleHighQuality,
     required this.onSendAlert,
   });
 
   final AppViewModel viewModel;
   final VoidCallback onStart;
   final VoidCallback onStop;
+  final VoidCallback onRestart;
+  final VoidCallback onToggleHighQuality;
   final VoidCallback onSendAlert;
 
   @override
@@ -1775,9 +2301,12 @@ class _StatusSection extends StatelessWidget {
         ? 0.0
         : (viewModel.localWindowDuration.inSeconds / localCapacitySeconds)
               .clamp(0.0, 1.0);
+    // Live capture takes the site's orange "REC" accent; idle stays muted green.
     final statusColor = recorder.isRecording
-        ? theme.colorScheme.primary
+        ? SonusColors.orange500
         : theme.colorScheme.outline;
+    final isHighQuality =
+        viewModel.config.sampleRate >= AppController.highQualitySampleRate;
     return _Section(
       title: 'Live Capture',
       child: Column(
@@ -1790,8 +2319,8 @@ class _StatusSection extends StatelessWidget {
                 width: 48,
                 height: 48,
                 decoration: BoxDecoration(
-                  color: statusColor.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(8),
+                  color: statusColor.withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(14),
                 ),
                 child: Icon(
                   recorder.isRecording ? Icons.mic : Icons.mic_off,
@@ -1898,12 +2427,12 @@ class _StatusSection extends StatelessWidget {
             spacing: 8,
             runSpacing: 8,
             children: [
-              FilledButton.icon(
+              SonusGradientButton(
+                label: 'Start',
+                icon: Icons.fiber_manual_record,
                 onPressed: recorder.isRecording || recorder.isStarting
                     ? null
                     : onStart,
-                icon: const Icon(Icons.fiber_manual_record),
-                label: const Text('Start'),
               ),
               OutlinedButton.icon(
                 onPressed: recorder.isRecording || recorder.isStarting
@@ -1913,11 +2442,38 @@ class _StatusSection extends StatelessWidget {
                 label: const Text('Stop'),
               ),
               OutlinedButton.icon(
+                onPressed: recorder.isRecording || recorder.isStarting
+                    ? onRestart
+                    : null,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Restart'),
+              ),
+              // High-quality capture toggle. Speaks a spoken cue and, when
+              // capture is live, re-opens the mic stream at the new sample rate.
+              FilledButton.tonalIcon(
+                onPressed: onToggleHighQuality,
+                icon: Icon(
+                  isHighQuality ? Icons.high_quality : Icons.high_quality_outlined,
+                ),
+                label: Text(
+                  isHighQuality ? 'High quality: On' : 'High quality: Off',
+                ),
+              ),
+              OutlinedButton.icon(
                 onPressed: onSendAlert,
                 icon: const Icon(Icons.notification_important_outlined),
                 label: const Text('Send Alert'),
               ),
             ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            isHighQuality
+                ? 'Capturing at ${viewModel.config.sampleRate ~/ 1000} kHz — music-grade fidelity.'
+                : 'Capturing at ${viewModel.config.sampleRate ~/ 1000} kHz — battery-friendly voice quality.',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
           ),
         ],
       ),
@@ -2369,17 +2925,31 @@ class _Section extends StatelessWidget {
     final theme = Theme.of(context);
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
-        border: Border.all(color: theme.colorScheme.outlineVariant),
-        borderRadius: BorderRadius.circular(8),
+        color: Colors.white,
+        border: Border.all(color: SonusColors.hairline),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: kSonusShadowSm,
       ),
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(title, style: theme.textTheme.titleMedium),
-            const SizedBox(height: 12),
+            Row(
+              children: [
+                Container(
+                  width: 4,
+                  height: 18,
+                  decoration: BoxDecoration(
+                    gradient: SonusColors.markGradient,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Text(title, style: theme.textTheme.titleMedium),
+              ],
+            ),
+            const SizedBox(height: 14),
             child,
           ],
         ),

@@ -21,5 +21,13 @@
 	<array>
 		<string>iCloud.YOUR.BUNDLE.ID</string>
 	</array>
+	<!--
+	  ShazamKit capability for the audio_dashcam/shazam bridge (song id when the
+	  user enables it). Enable "ShazamKit" on the App ID in the Apple Developer
+	  portal; Xcode adds this entitlement when the capability is turned on. Song
+	  identification simply fails soft (returns no match) without it.
+	-->
+	<key>com.apple.developer.shazamkit</key>
+	<true/>
 </dict>
 </plist>
