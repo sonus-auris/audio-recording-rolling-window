@@ -25,6 +25,7 @@ import '../services/diagnostic_log.dart';
 import '../services/playback_service.dart';
 import '../services/power_network_gate.dart';
 import '../services/recording_feedback.dart';
+import '../services/spectral_sidecar.dart';
 import '../services/s3_storage_client.dart';
 import '../services/segment_index.dart';
 import '../services/segment_recorder.dart';
@@ -156,6 +157,19 @@ class AppController {
           (message, detections) =>
               (message: message, detections: detections),
         );
+    // Fold the init + starting flags into one slot (combineLatest is at its max
+    // arity of 9 below).
+    final lifecycle =
+        Rx.combineLatest2<
+          bool,
+          bool,
+          ({bool isInitializing, bool isStarting})
+        >(
+          _isInitializing,
+          _isStarting,
+          (isInitializing, isStarting) =>
+              (isInitializing: isInitializing, isStarting: isStarting),
+        );
     _viewModels =
         Rx.combineLatest9<
               AppConfig,
@@ -164,7 +178,7 @@ class AppController {
               RecorderSnapshot,
               PlaybackSnapshot,
               List<String>,
-              bool,
+              ({bool isInitializing, bool isStarting}),
               ({bool isUploading, TransferGateStatus transfer}),
               ({String? message, List<AcousticDetection> detections}),
               AppViewModel
@@ -175,7 +189,7 @@ class AppController {
               _recorder.snapshots,
               _playback.snapshots,
               _diagnostics.entries,
-              _isInitializing,
+              lifecycle,
               uploadStatus,
               messageAndDetections,
               (
@@ -185,7 +199,7 @@ class AppController {
                 recorder,
                 playback,
                 diagnosticEntries,
-                isInitializing,
+                lifecycleState,
                 uploadState,
                 messageState,
               ) {
@@ -196,7 +210,8 @@ class AppController {
                   recorder: recorder,
                   playback: playback,
                   diagnosticEntries: diagnosticEntries,
-                  isInitializing: isInitializing,
+                  isInitializing: lifecycleState.isInitializing,
+                  isStarting: lifecycleState.isStarting,
                   isUploading: uploadState.isUploading,
                   transferStatus: uploadState.transfer,
                   message: messageState.message,
@@ -248,6 +263,9 @@ class AppController {
   final BehaviorSubject<List<RecordingSegment>> _segments =
       BehaviorSubject.seeded(const []);
   final BehaviorSubject<bool> _isInitializing = BehaviorSubject.seeded(true);
+  /// True while [startRecording] is in flight (permission prompts loading, mic
+  /// stream opening) so the UI can show a spinner instead of a frozen button.
+  final BehaviorSubject<bool> _isStarting = BehaviorSubject.seeded(false);
   final BehaviorSubject<bool> _isUploading = BehaviorSubject.seeded(false);
   final BehaviorSubject<TransferGateStatus> _transfer =
       BehaviorSubject.seeded(const TransferGateStatus.unknown());
@@ -267,6 +285,9 @@ class AppController {
   BackendUploadSession? _backendSession;
   String? _backendSessionKey;
   final List<AudioTriggerEvent> _pendingAlertEvents = [];
+
+  /// Writes the time-aligned FFT feature sidecar next to each finalized segment.
+  final SpectralSidecar _spectralSidecar = SpectralSidecar();
 
   Stream<AppViewModel> get viewModels => _viewModels;
 
@@ -336,6 +357,12 @@ class AppController {
     await _ensureSupabaseReady();
     requestUploadDrain();
     await _enforceRetention();
+    // "Always-on": if the user enabled auto-start, begin capturing on launch
+    // (including the boot-triggered relaunch) without them pressing Start.
+    if (config.autoStartCaptureEnabled && !_recorder.isRecording) {
+      _diagnostics.add('Auto-start capture is enabled; starting recording.');
+      await startRecording();
+    }
   }
 
   Future<void> _onTransferConditionsChanged() async {
@@ -742,24 +769,32 @@ class AppController {
 
   Future<void> startRecording() async {
     _diagnostics.add('Start recording requested.');
-    final backgroundError = await _backgroundCaptureService.start();
-    if (backgroundError != null) {
-      _diagnostics.add(backgroundError);
-    }
+    // Surface a busy state for the whole flow — the notification + microphone
+    // permission prompts can take a moment to appear, and the button should
+    // spin rather than look unresponsive while the user waits for them.
+    _isStarting.add(true);
     try {
-      _diagnostics.add('Starting PCM microphone stream.');
-      await _recorder.start(_config.value);
-      _diagnostics.add('PCM microphone stream started.');
-      unawaited(_feedback.say('Recording started'));
-      _message.add(
-        backgroundError == null
-            ? 'Recording started.'
-            : 'Recording started locally. $backgroundError',
-      );
-    } catch (error) {
-      _diagnostics.add('Recorder start failed: $error.');
-      await _backgroundCaptureService.stop();
-      _message.add(error.toString());
+      final backgroundError = await _backgroundCaptureService.start();
+      if (backgroundError != null) {
+        _diagnostics.add(backgroundError);
+      }
+      try {
+        _diagnostics.add('Starting PCM microphone stream.');
+        await _recorder.start(_config.value);
+        _diagnostics.add('PCM microphone stream started.');
+        unawaited(_feedback.say('Recording started'));
+        _message.add(
+          backgroundError == null
+              ? 'Recording started.'
+              : 'Recording started locally. $backgroundError',
+        );
+      } catch (error) {
+        _diagnostics.add('Recorder start failed: $error.');
+        await _backgroundCaptureService.stop();
+        _message.add(error.toString());
+      }
+    } finally {
+      _isStarting.add(false);
     }
   }
 
@@ -837,6 +872,27 @@ class AppController {
 
   Future<void> playLocalWindow() async {
     await _playback.playSegments(_segments.value);
+  }
+
+  /// Play a chosen wall-clock window across the rolling buffer, optionally looping.
+  Future<void> playRange({
+    required DateTime startUtc,
+    required DateTime endUtc,
+    bool loop = false,
+  }) async {
+    await _playback.playRange(_segments.value, startUtc, endUtc, loop: loop);
+  }
+
+  /// Earliest local audio currently available (for the playback range picker),
+  /// or null when nothing is buffered yet.
+  DateTime? get earliestLocalSegmentUtc {
+    final locals = _segments.value.where((s) => s.localPath != null).toList();
+    if (locals.isEmpty) {
+      return null;
+    }
+    return locals
+        .map((s) => s.startedAtUtc)
+        .reduce((a, b) => a.isBefore(b) ? a : b);
   }
 
   Future<void> pausePlayback() => _playback.pause();
@@ -1373,6 +1429,7 @@ class AppController {
     await _secrets.close();
     await _segments.close();
     await _isInitializing.close();
+    await _isStarting.close();
     await _isUploading.close();
     await _transfer.close();
     await _message.close();
@@ -1382,6 +1439,15 @@ class AppController {
   Future<void> _onSegmentClosed(RecordingSegment segment) async {
     final tagged = await _attachGeoTag(segment);
     await _segmentIndex.upsertSegment(tagged);
+    // Write the parallel FFT analysis track next to the audio (best-effort, off
+    // the realtime capture path). Independent of the loudness-gated detector.
+    if (_config.hasValue && _config.value.spectralSidecarEnabled) {
+      try {
+        await _spectralSidecar.writeForSegment(tagged);
+      } catch (error) {
+        _diagnostics.add('Spectral sidecar failed: $error');
+      }
+    }
     final nextSegments = await _segmentIndex.loadSegments();
     _segments.add(nextSegments);
     requestUploadDrain();

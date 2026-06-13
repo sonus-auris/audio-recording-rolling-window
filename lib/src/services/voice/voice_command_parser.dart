@@ -1,4 +1,5 @@
 import '../../models/voice_command.dart';
+import 'voice_limits.dart';
 
 /// Turns a free-text transcript (from on-device or cloud STT) into a structured
 /// [VoiceCommand].
@@ -58,7 +59,12 @@ class VoiceCommandParser {
   /// Lowercases, collapses whitespace, and strips a leading wake word and
   /// trailing punctuation so patterns can stay simple.
   String _normalize(String input) {
-    var text = input.trim().toLowerCase();
+    // Bound the work the rule regexes do: an utterance is never this long, so
+    // truncating only ever clips a pathological/abusive transcript (ReDoS / CPU
+    // guard) before any matching runs.
+    var text = VoiceLimits.clip(input, VoiceLimits.maxTranscriptChars)
+        .trim()
+        .toLowerCase();
     text = text.replaceAll(RegExp(r'\s+'), ' ');
     for (final wake in wakeWords) {
       if (text.startsWith(wake)) {
@@ -277,7 +283,15 @@ class VoiceCommandParser {
   // --- Helpers ------------------------------------------------------------
 
   static String _toSeconds(String value, String unit) {
-    final n = int.tryParse(value) ?? 0;
+    // Clamp the raw count before multiplying so a huge spoken number can't
+    // overflow 64-bit math into a wrong (possibly in-range) duration. The
+    // handler enforces the real cap; this just keeps the arithmetic sane.
+    final parsed = int.tryParse(value) ?? 0;
+    final n = parsed < 0
+        ? 0
+        : (parsed > VoiceLimits.maxTimerSeconds
+            ? VoiceLimits.maxTimerSeconds
+            : parsed);
     switch (unit) {
       case 'hour':
         return (n * 3600).toString();

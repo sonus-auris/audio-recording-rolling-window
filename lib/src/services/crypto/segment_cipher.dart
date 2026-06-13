@@ -38,7 +38,9 @@ class SegmentCipher {
 
   static const List<int> magic = <int>[0x53, 0x41, 0x43, 0x31]; // "SAC1"
   static const int version = 1;
+  static const int versionMultiRecipient = 2;
   static const int _flagWrappedByMasterKey = 0x01;
+  static const int _flagAccountRecipient = 0x02;
 
   /// AES-GCM standard sizes, in bytes.
   static const int nonceLength = 12;
@@ -49,15 +51,24 @@ class SegmentCipher {
   final AesGcm _aead;
 
   /// Encrypts [plaintext] under a fresh DEK and returns the self-describing
-  /// container. [wrapDek] is supplied by the [KeyManager] and seals the DEK
-  /// with the device master key.
+  /// container. [wrapDek] (from the [KeyManager]) seals the DEK with the device
+  /// master key so this device can read its own segment.
+  ///
+  /// When [wrapForAccount] is supplied (the device has an account public key),
+  /// the DEK is *also* sealed to the account recipient, producing a v2
+  /// multi-recipient container that the desktop master can open with the account
+  /// private key. Without it, a v1 container is produced exactly as before.
   Future<Uint8List> seal({
     required Uint8List plaintext,
     required Future<Uint8List> Function(SecretKey dek) wrapDek,
+    Future<Uint8List> Function(SecretKey dek)? wrapForAccount,
   }) async {
     final dek = await _aead.newSecretKey();
     final wrappedDek = await wrapDek(dek);
-    if (wrappedDek.length > 0xFFFF) {
+    final accountWrapped =
+        wrapForAccount == null ? null : await wrapForAccount(dek);
+    if (wrappedDek.length > 0xFFFF ||
+        (accountWrapped != null && accountWrapped.length > 0xFFFF)) {
       throw ArgumentError('Wrapped DEK is too large to encode.');
     }
     final contentBox = await _aead.encrypt(plaintext, secretKey: dek);
@@ -65,10 +76,19 @@ class SegmentCipher {
 
     final out = BytesBuilder(copy: false);
     out.add(magic);
-    out.addByte(version);
-    out.addByte(_flagWrappedByMasterKey);
-    out.add(_u16be(wrappedDek.length));
-    out.add(wrappedDek);
+    if (accountWrapped == null) {
+      out.addByte(version);
+      out.addByte(_flagWrappedByMasterKey);
+      out.add(_u16be(wrappedDek.length));
+      out.add(wrappedDek);
+    } else {
+      out.addByte(versionMultiRecipient);
+      out.addByte(_flagWrappedByMasterKey | _flagAccountRecipient);
+      out.add(_u16be(wrappedDek.length));
+      out.add(wrappedDek);
+      out.add(_u16be(accountWrapped.length));
+      out.add(accountWrapped);
+    }
     out.add(contentBytes);
     return out.toBytes();
   }
@@ -103,25 +123,39 @@ class SegmentCipher {
       }
     }
     final ver = container[4];
-    if (ver != version) {
+    if (ver != version && ver != versionMultiRecipient) {
       throw FormatException('Unsupported segment cipher version: $ver.');
     }
     final flags = container[5];
     final wrappedDekLen = (container[6] << 8) | container[7];
-    final contentOffset = _headerFixedLength + wrappedDekLen;
-    if (container.length < contentOffset + nonceLength + macLength) {
+    var offset = _headerFixedLength + wrappedDekLen;
+    if (container.length < offset + 2) {
       throw const FormatException('Encrypted segment is truncated.');
     }
-    final wrappedDek = Uint8List.sublistView(
-      container,
-      _headerFixedLength,
-      contentOffset,
-    );
+    final wrappedDek =
+        Uint8List.sublistView(container, _headerFixedLength, offset);
+
+    Uint8List? accountWrappedDek;
+    if (ver == versionMultiRecipient && (flags & _flagAccountRecipient) != 0) {
+      final accountLen = (container[offset] << 8) | container[offset + 1];
+      final accountStart = offset + 2;
+      final accountEnd = accountStart + accountLen;
+      if (container.length < accountEnd) {
+        throw const FormatException('Encrypted segment is truncated.');
+      }
+      accountWrappedDek =
+          Uint8List.sublistView(container, accountStart, accountEnd);
+      offset = accountEnd;
+    }
+    if (container.length < offset + nonceLength + macLength) {
+      throw const FormatException('Encrypted segment is truncated.');
+    }
     return SegmentHeader(
       version: ver,
       flags: flags,
       wrappedDek: wrappedDek,
-      contentOffset: contentOffset,
+      accountWrappedDek: accountWrappedDek,
+      contentOffset: offset,
     );
   }
 
@@ -152,10 +186,18 @@ class SegmentHeader {
     required this.flags,
     required this.wrappedDek,
     required this.contentOffset,
+    this.accountWrappedDek,
   });
 
   final int version;
   final int flags;
+
+  /// DEK wrapped to this device's master key (lets the device read its own).
   final Uint8List wrappedDek;
+
+  /// DEK sealed to the account public key (lets the desktop master read it),
+  /// present only in v2 multi-recipient containers.
+  final Uint8List? accountWrappedDek;
+
   final int contentOffset;
 }

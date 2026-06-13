@@ -17,7 +17,7 @@ class BackgroundCaptureService {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'audio_dashcam_capture',
-        channelName: 'Audio Dashcam',
+        channelName: 'Sonus Auris',
         channelDescription: 'Shows while audio capture is active.',
         onlyAlertOnce: true,
         playSound: false,
@@ -60,7 +60,7 @@ class BackgroundCaptureService {
       final result = await FlutterForegroundTask.startService(
         serviceId: 500,
         serviceTypes: const [ForegroundServiceTypes.microphone],
-        notificationTitle: 'Audio Dashcam is recording',
+        notificationTitle: 'Sonus Auris is recording',
         notificationText: 'Rolling local window and cloud upload are active.',
         callback: audioDashcamForegroundCallback,
       );

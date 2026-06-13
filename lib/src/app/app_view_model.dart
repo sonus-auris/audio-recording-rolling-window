@@ -18,6 +18,7 @@ class AppViewModel {
     required this.diagnosticEntries,
     required this.isInitializing,
     required this.isUploading,
+    this.isStarting = false,
     this.transferStatus = const TransferGateStatus.unknown(),
     this.message,
     this.detections = const [],
@@ -31,6 +32,11 @@ class AppViewModel {
   final List<String> diagnosticEntries;
   final bool isInitializing;
   final bool isUploading;
+
+  /// True from the moment "Start" is tapped until capture is live (or fails) —
+  /// covers the wait while the OS permission prompts load, so the button can show
+  /// a spinner instead of looking frozen.
+  final bool isStarting;
 
   /// Most recent acoustic-intelligence detections, newest first.
   final List<AcousticDetection> detections;

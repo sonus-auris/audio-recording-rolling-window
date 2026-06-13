@@ -29,6 +29,7 @@ class AppConfig {
     this.autoGain = true,
     this.noiseSuppress = true,
     this.verbalCuesEnabled = false,
+    this.autoStartCaptureEnabled = false,
     this.locationTaggingEnabled = false,
     this.soundCloudDailyArchive = false,
     this.spotifyAutoPlaylist = false,
@@ -37,6 +38,7 @@ class AppConfig {
     this.lowBatteryThresholdPercent = 20,
     this.uploadNetworkPolicy = UploadNetworkPolicy.any,
     this.acousticAnalysisEnabled = false,
+    this.spectralSidecarEnabled = true,
     this.analysisActivationDb = -40.0,
     this.analysisSustainSeconds = 2.0,
     this.analysisHoldSeconds = 45.0,
@@ -111,6 +113,11 @@ class AppConfig {
   /// Speak short confirmations ("recording", "saved") while capturing.
   final bool verbalCuesEnabled;
 
+  /// "Always-on": after the user enables it once, capture starts automatically
+  /// whenever the app launches (including the relaunch the boot receiver triggers
+  /// after a reboot), so they never have to press Start again. Off by default.
+  final bool autoStartCaptureEnabled;
+
   /// Opt-in GPS evidence tagging: stamp each segment with the capture location
   /// so a clip can prove where it was recorded. Off by default; requires the
   /// user to grant location permission.
@@ -146,6 +153,12 @@ class AppConfig {
   /// Master switch for the on-device FFT acoustic-intelligence engine. When off,
   /// no spectral analysis runs and nothing is fed to the analyzer isolate.
   final bool acousticAnalysisEnabled;
+
+  /// When on, every finalized rolling segment also gets a time-aligned spectral
+  /// feature sidecar (`<stem>.features.json`) written next to its WAV — an FFT
+  /// decomposition track parallel to the audio. Independent of the loudness-gated
+  /// [acousticAnalysisEnabled] detection engine.
+  final bool spectralSidecarEnabled;
 
   /// The analysis engine stays idle until the input is sustained at or above
   /// [analysisActivationDb] (dBFS) for [analysisSustainSeconds]. This is the
@@ -292,6 +305,7 @@ class AppConfig {
     bool? autoGain,
     bool? noiseSuppress,
     bool? verbalCuesEnabled,
+    bool? autoStartCaptureEnabled,
     bool? locationTaggingEnabled,
     bool? soundCloudDailyArchive,
     bool? spotifyAutoPlaylist,
@@ -300,6 +314,7 @@ class AppConfig {
     int? lowBatteryThresholdPercent,
     UploadNetworkPolicy? uploadNetworkPolicy,
     bool? acousticAnalysisEnabled,
+    bool? spectralSidecarEnabled,
     double? analysisActivationDb,
     double? analysisSustainSeconds,
     double? analysisHoldSeconds,
@@ -343,6 +358,8 @@ class AppConfig {
       autoGain: autoGain ?? this.autoGain,
       noiseSuppress: noiseSuppress ?? this.noiseSuppress,
       verbalCuesEnabled: verbalCuesEnabled ?? this.verbalCuesEnabled,
+      autoStartCaptureEnabled:
+          autoStartCaptureEnabled ?? this.autoStartCaptureEnabled,
       locationTaggingEnabled:
           locationTaggingEnabled ?? this.locationTaggingEnabled,
       soundCloudDailyArchive:
@@ -356,6 +373,8 @@ class AppConfig {
       uploadNetworkPolicy: uploadNetworkPolicy ?? this.uploadNetworkPolicy,
       acousticAnalysisEnabled:
           acousticAnalysisEnabled ?? this.acousticAnalysisEnabled,
+      spectralSidecarEnabled:
+          spectralSidecarEnabled ?? this.spectralSidecarEnabled,
       analysisActivationDb: analysisActivationDb ?? this.analysisActivationDb,
       analysisSustainSeconds:
           analysisSustainSeconds ?? this.analysisSustainSeconds,
@@ -406,6 +425,7 @@ class AppConfig {
       'autoGain': autoGain,
       'noiseSuppress': noiseSuppress,
       'verbalCuesEnabled': verbalCuesEnabled,
+      'autoStartCaptureEnabled': autoStartCaptureEnabled,
       'locationTaggingEnabled': locationTaggingEnabled,
       'soundCloudDailyArchive': soundCloudDailyArchive,
       'spotifyAutoPlaylist': spotifyAutoPlaylist,
@@ -414,6 +434,7 @@ class AppConfig {
       'lowBatteryThresholdPercent': lowBatteryThresholdPercent,
       'uploadNetworkPolicy': uploadNetworkPolicy.wireName,
       'acousticAnalysisEnabled': acousticAnalysisEnabled,
+      'spectralSidecarEnabled': spectralSidecarEnabled,
       'analysisActivationDb': analysisActivationDb,
       'analysisSustainSeconds': analysisSustainSeconds,
       'analysisHoldSeconds': analysisHoldSeconds,
@@ -463,6 +484,8 @@ class AppConfig {
       autoGain: json['autoGain'] as bool? ?? true,
       noiseSuppress: json['noiseSuppress'] as bool? ?? true,
       verbalCuesEnabled: json['verbalCuesEnabled'] as bool? ?? false,
+      autoStartCaptureEnabled:
+          json['autoStartCaptureEnabled'] as bool? ?? false,
       locationTaggingEnabled: json['locationTaggingEnabled'] as bool? ?? false,
       soundCloudDailyArchive: json['soundCloudDailyArchive'] as bool? ?? false,
       spotifyAutoPlaylist: json['spotifyAutoPlaylist'] as bool? ?? false,
@@ -478,6 +501,8 @@ class AppConfig {
       ),
       acousticAnalysisEnabled:
           json['acousticAnalysisEnabled'] as bool? ?? false,
+      spectralSidecarEnabled:
+          json['spectralSidecarEnabled'] as bool? ?? true,
       analysisActivationDb: _asDouble(json['analysisActivationDb'], -40.0)
           .clamp(-90.0, 0.0),
       analysisSustainSeconds: _asDouble(json['analysisSustainSeconds'], 2.0)

@@ -1,11 +1,13 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'src/app/app_controller.dart';
 import 'src/app/app_view_model.dart';
+import 'src/platform/form_factor.dart';
 import 'src/models/acoustic_detection.dart';
 import 'src/models/app_config.dart';
 import 'src/models/cloud_connection.dart';
@@ -160,6 +162,30 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _uploadEnabled = true;
   int _selectedIndex = 0;
 
+  /// Persisted so an OS-kill + relaunch (e.g. the low-memory killer reclaiming
+  /// the backgrounded app, which `flutter_foreground_task` then restarts) lands
+  /// back on the tab you were last on instead of resetting to Home.
+  static const _kLastTabKey = 'last_tab_index';
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreSelectedTab();
+  }
+
+  Future<void> _restoreSelectedTab() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getInt(_kLastTabKey);
+    if (saved != null && saved >= 0 && saved <= 2 && mounted) {
+      setState(() => _selectedIndex = saved);
+    }
+  }
+
+  Future<void> _persistSelectedTab(int index) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_kLastTabKey, index);
+  }
+
   @override
   void dispose() {
     for (final controller in [
@@ -225,14 +251,30 @@ class _SettingsPageState extends State<SettingsPage> {
                       ),
                     ],
                   ),
-                Expanded(child: _selectedBody(viewModel)),
+                // Desktop ("recorder on a bigger screen"): same logic, but
+                // centered and width-constrained so it reads as a desktop panel
+                // rather than a stretched phone. See lib/src/platform/form_factor.
+                Expanded(
+                  child: Platforms.isDesktop
+                      ? Center(
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(
+                              maxWidth: Platforms.desktopContentMaxWidth,
+                            ),
+                            child: _selectedBody(viewModel),
+                          ),
+                        )
+                      : _selectedBody(viewModel),
+                ),
               ],
             ),
           ),
           bottomNavigationBar: NavigationBar(
             selectedIndex: _selectedIndex,
-            onDestinationSelected: (index) =>
-                setState(() => _selectedIndex = index),
+            onDestinationSelected: (index) {
+              setState(() => _selectedIndex = index);
+              _persistSelectedTab(index);
+            },
             destinations: const [
               NavigationDestination(
                 icon: Icon(Icons.dashboard_outlined),
@@ -265,6 +307,13 @@ class _SettingsPageState extends State<SettingsPage> {
           onPausePlayback: widget.controller.pausePlayback,
           onStopPlayback: widget.controller.stopPlayback,
           onSendAlert: widget.controller.sendManualAlert,
+          earliestLocalUtc: widget.controller.earliestLocalSegmentUtc,
+          onPlayRange: (startUtc, endUtc, loop) =>
+              widget.controller.playRange(
+                startUtc: startUtc,
+                endUtc: endUtc,
+                loop: loop,
+              ),
           onSaveRangePermanently: (startedAtUtc, endedAtUtc) =>
               widget.controller.saveRangePermanently(
                 startedAtUtc: startedAtUtc,
@@ -589,6 +638,8 @@ class _PlaybackView extends StatefulWidget {
     required this.onPausePlayback,
     required this.onStopPlayback,
     required this.onSendAlert,
+    required this.earliestLocalUtc,
+    required this.onPlayRange,
     required this.onSaveRangePermanently,
   });
 
@@ -597,6 +648,12 @@ class _PlaybackView extends StatefulWidget {
   final VoidCallback onPausePlayback;
   final VoidCallback onStopPlayback;
   final VoidCallback onSendAlert;
+
+  /// Earliest local audio available, for clamping the range picker.
+  final DateTime? earliestLocalUtc;
+
+  /// Play a chosen wall-clock window (loop optional) across the rolling buffer.
+  final void Function(DateTime startUtc, DateTime endUtc, bool loop) onPlayRange;
   final Future<void> Function(DateTime startedAtUtc, DateTime endedAtUtc)
   onSaveRangePermanently;
 
@@ -610,6 +667,11 @@ class _PlaybackViewState extends State<_PlaybackView> {
 
   bool _rangeSeeded = false;
   bool _isSavingRange = false;
+
+  // Range-playback picker state.
+  DateTime? _playStart;
+  DateTime? _playEnd;
+  bool _loopRange = true;
 
   @override
   void initState() {
@@ -709,6 +771,11 @@ class _PlaybackViewState extends State<_PlaybackView> {
               ],
             ],
           ),
+        ),
+        const SizedBox(height: 16),
+        _Section(
+          title: 'Range Playback',
+          child: _buildRangePlayback(context, viewModel),
         ),
         const SizedBox(height: 16),
         _Section(
@@ -817,6 +884,176 @@ class _PlaybackViewState extends State<_PlaybackView> {
       }
     }
   }
+
+  Widget _buildRangePlayback(BuildContext context, AppViewModel viewModel) {
+    final theme = Theme.of(context);
+    final now = DateTime.now();
+    final earliest = widget.earliestLocalUtc?.toLocal() ??
+        now.subtract(Duration(hours: viewModel.config.deviceRetentionHours));
+    // Lazy seed: default to the last 10 minutes up to "now".
+    _playEnd ??= now;
+    _playStart ??= _maxDate(earliest, now.subtract(const Duration(minutes: 10)));
+
+    var domainMin = earliest;
+    var domainMax = now;
+    if (!domainMax.isAfter(domainMin)) {
+      domainMax = domainMin.add(const Duration(seconds: 1));
+    }
+    final start = _clampDate(_playStart!, domainMin, domainMax);
+    final end = _clampDate(_maxDate(_playEnd!, start), domainMin, domainMax);
+    final minMs = domainMin.millisecondsSinceEpoch.toDouble();
+    final maxMs = domainMax.millisecondsSinceEpoch.toDouble();
+    final startMs =
+        start.millisecondsSinceEpoch.toDouble().clamp(minMs, maxMs);
+    final endMs = end.millisecondsSinceEpoch.toDouble().clamp(startMs, maxMs);
+    final hasAudio = viewModel.localSegments.isNotEmpty;
+    // Whether any local segment actually overlaps the chosen window — so we can
+    // surface "nothing here" inline in *this* card (and disable Play) rather than
+    // routing it through the shared playback snapshot, which renders up in the
+    // Playback card.
+    final rangeHasAudio = viewModel.segments.any(
+      (s) =>
+          s.localPath != null &&
+          s.endedAtUtc.isAfter(start.toUtc()) &&
+          s.startedAtUtc.isBefore(end.toUtc()),
+    );
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Pick a window from the last ${viewModel.config.deviceRetentionHours} h '
+          'up to now, then play it — or loop it.',
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+        ),
+        RangeSlider(
+          min: minMs,
+          max: maxMs,
+          values: RangeValues(startMs, endMs),
+          labels: RangeLabels(_clockLabel(start), _clockLabel(end)),
+          onChanged: hasAudio
+              ? (v) => setState(() {
+                    _playStart =
+                        DateTime.fromMillisecondsSinceEpoch(v.start.round());
+                    _playEnd =
+                        DateTime.fromMillisecondsSinceEpoch(v.end.round());
+                  })
+              : null,
+        ),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: () => _pickDateTime(true, domainMin, domainMax),
+                icon: const Icon(Icons.first_page, size: 16),
+                label: Text('Start  ${_clockLabel(start)}',
+                    overflow: TextOverflow.ellipsis),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: () => _pickDateTime(false, domainMin, domainMax),
+                icon: const Icon(Icons.last_page, size: 16),
+                label: Text('End  ${_clockLabel(end)}',
+                    overflow: TextOverflow.ellipsis),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Wrap(
+          spacing: 8,
+          children: [
+            for (final preset in const [
+              (label: 'Last 1m', minutes: 1),
+              (label: 'Last 10m', minutes: 10),
+              (label: 'Last 1h', minutes: 60),
+            ])
+              ActionChip(
+                label: Text(preset.label),
+                onPressed: hasAudio
+                    ? () => setState(() {
+                          final e = DateTime.now();
+                          _playEnd = e;
+                          _playStart = _maxDate(
+                              earliest, e.subtract(Duration(minutes: preset.minutes)));
+                        })
+                    : null,
+              ),
+          ],
+        ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          title: const Text('Loop this range'),
+          value: _loopRange,
+          onChanged: (v) => setState(() => _loopRange = v),
+        ),
+        Row(
+          children: [
+            FilledButton.icon(
+              onPressed: hasAudio && rangeHasAudio
+                  ? () =>
+                      widget.onPlayRange(start.toUtc(), end.toUtc(), _loopRange)
+                  : null,
+              icon: Icon(_loopRange ? Icons.repeat : Icons.play_arrow),
+              label: Text(_loopRange ? 'Play range (loop)' : 'Play range'),
+            ),
+            if (hasAudio && !rangeHasAudio) ...[
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  'No local audio in that time range.',
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ],
+    );
+  }
+
+  Future<void> _pickDateTime(bool isStart, DateTime lo, DateTime hi) async {
+    final current = _clampDate((isStart ? _playStart : _playEnd) ?? hi, lo, hi);
+    final date = await showDatePicker(
+      context: context,
+      initialDate: current,
+      firstDate: lo,
+      lastDate: hi,
+    );
+    if (date == null || !mounted) {
+      return;
+    }
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(current),
+    );
+    if (time == null || !mounted) {
+      return;
+    }
+    final picked =
+        DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    setState(() {
+      if (isStart) {
+        _playStart = picked;
+      } else {
+        _playEnd = picked;
+      }
+    });
+  }
+
+  DateTime _maxDate(DateTime a, DateTime b) => a.isAfter(b) ? a : b;
+
+  DateTime _clampDate(DateTime v, DateTime lo, DateTime hi) =>
+      v.isBefore(lo) ? lo : (v.isAfter(hi) ? hi : v);
+
+  String _clockLabel(DateTime d) =>
+      '${d.month}/${d.day} ${d.hour.toString().padLeft(2, '0')}:'
+      '${d.minute.toString().padLeft(2, '0')}';
 
   DateTime? _parseTimestamp(String value) {
     final trimmed = value.trim();
@@ -1387,6 +1624,7 @@ class _AudioTuningSectionState extends State<_AudioTuningSection> {
   late bool _autoGain;
   late bool _noiseSuppress;
   late bool _verbalCues;
+  late bool _autoStart;
   late bool _locationTagging;
 
   void _seed(AppConfig config) {
@@ -1399,6 +1637,7 @@ class _AudioTuningSectionState extends State<_AudioTuningSection> {
     _autoGain = config.autoGain;
     _noiseSuppress = config.noiseSuppress;
     _verbalCues = config.verbalCuesEnabled;
+    _autoStart = config.autoStartCaptureEnabled;
     _locationTagging = config.locationTaggingEnabled;
     _syncedDeviceId = config.deviceId;
   }
@@ -1415,6 +1654,7 @@ class _AudioTuningSectionState extends State<_AudioTuningSection> {
         autoGain: _autoGain,
         noiseSuppress: _noiseSuppress,
         verbalCuesEnabled: _verbalCues,
+        autoStartCaptureEnabled: _autoStart,
         locationTaggingEnabled: _locationTagging,
       ),
     );
@@ -1529,6 +1769,19 @@ class _AudioTuningSectionState extends State<_AudioTuningSection> {
             value: _verbalCues,
             onChanged: (value) {
               setState(() => _verbalCues = value);
+              _apply();
+            },
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Always-on (auto-start capture)'),
+            subtitle: const Text(
+              'Start recording automatically when the app opens and after a '
+              'reboot — no need to press Start each time.',
+            ),
+            value: _autoStart,
+            onChanged: (value) {
+              setState(() => _autoStart = value);
               _apply();
             },
           ),
@@ -2295,7 +2548,10 @@ class _StatusSection extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final recorder = viewModel.recorder;
-    final peak = ((recorder.peakDb + 60) / 60).clamp(0.0, 1.0);
+    // Drive the live bar from the *instantaneous* level (averageDb = the plugin's
+    // amplitude.current), not peakDb (amplitude.max), which is monotonic
+    // max-since-start and so latches at the top once you speak loudly once.
+    final level = ((recorder.averageDb + 60) / 60).clamp(0.0, 1.0);
     final localCapacitySeconds = viewModel.config.deviceRetentionHours * 3600;
     final localProgress = localCapacitySeconds <= 0
         ? 0.0
@@ -2363,7 +2619,7 @@ class _StatusSection extends StatelessWidget {
               Text('Input level', style: theme.textTheme.labelLarge),
               const Spacer(),
               Text(
-                '${recorder.peakDb.toStringAsFixed(0)} dB',
+                '${recorder.averageDb.toStringAsFixed(0)} dB',
                 style: theme.textTheme.labelMedium?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
@@ -2375,7 +2631,7 @@ class _StatusSection extends StatelessWidget {
             borderRadius: BorderRadius.circular(4),
             child: LinearProgressIndicator(
               minHeight: 8,
-              value: peak,
+              value: level,
               backgroundColor: theme.colorScheme.surfaceContainerHighest,
             ),
           ),
@@ -2427,13 +2683,33 @@ class _StatusSection extends StatelessWidget {
             spacing: 8,
             runSpacing: 8,
             children: [
-              SonusGradientButton(
-                label: 'Start',
-                icon: Icons.fiber_manual_record,
-                onPressed: recorder.isRecording || recorder.isStarting
-                    ? null
-                    : onStart,
-              ),
+              // `viewModel.isStarting` spans the whole start flow — including the
+              // wait while the OS permission prompts load — so the button shows a
+              // spinner instead of looking unresponsive (recorder.isStarting only
+              // flips once the mic stream itself begins, after permissions).
+              if (viewModel.isStarting || recorder.isStarting)
+                const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SonusGradientButton(
+                      label: 'Starting…',
+                      icon: Icons.fiber_manual_record,
+                      onPressed: null,
+                    ),
+                    SizedBox(width: 10),
+                    SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ],
+                )
+              else
+                SonusGradientButton(
+                  label: 'Start',
+                  icon: Icons.fiber_manual_record,
+                  onPressed: recorder.isRecording ? null : onStart,
+                ),
               OutlinedButton.icon(
                 onPressed: recorder.isRecording || recorder.isStarting
                     ? onStop

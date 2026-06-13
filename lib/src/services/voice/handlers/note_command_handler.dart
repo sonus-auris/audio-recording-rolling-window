@@ -1,5 +1,6 @@
 import '../../../models/voice_command.dart';
 import '../voice_command_handler.dart';
+import '../voice_limits.dart';
 
 /// A captured note / task created by voice.
 class VoiceNote {
@@ -67,7 +68,8 @@ class NoteCommandHandler implements VoiceCommandHandler {
 
   @override
   Future<VoiceCommandResult> handle(VoiceCommand command) async {
-    final text = (command.slot('text') ?? '').trim();
+    final text =
+        VoiceLimits.clip(command.slot('text'), VoiceLimits.maxNoteChars).trim();
     if (text.isEmpty) {
       return VoiceCommandResult.failure(
         command,

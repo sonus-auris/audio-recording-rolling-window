@@ -4,12 +4,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Resume the capture foreground service automatically after a reboot, so
+         the rolling window keeps running without the user re-opening the app. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Optional GPS evidence tagging (off by default). -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <application
-        android:label="Audio Dashcam"
+        android:label="Sonus Auris"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
@@ -42,6 +45,12 @@
             android:exported="false"
             android:foregroundServiceType="microphone"
             android:stopWithTask="false" />
+        <!-- The boot receiver that restarts capture after a reboot is declared by
+             flutter_foreground_task's own manifest (with the correct
+             android:exported="true" for a BOOT_COMPLETED receiver). Re-declaring
+             it here caused a manifest-merger conflict on @exported, so we rely on
+             the plugin's declaration; we keep the RECEIVE_BOOT_COMPLETED
+             permission above. -->
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

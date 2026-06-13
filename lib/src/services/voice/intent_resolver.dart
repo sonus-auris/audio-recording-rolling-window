@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 
 import '../../models/voice_command.dart';
 import 'voice_command_parser.dart';
+import 'voice_limits.dart';
 
 /// The seam between *transcript* and *structured command*.
 ///
@@ -64,12 +65,26 @@ class RuleBasedIntentResolver implements IntentResolver {
 /// works unchanged regardless of which backend answers. Fails soft to
 /// [VoiceIntent.unknown] so a backend error never crashes the pipeline.
 class LlmIntentResolver implements IntentResolver {
+  /// Throws [ArgumentError] if [endpoint] is not a safe destination for
+  /// transcripts. Because the body carries always-on-mic transcript text — the
+  /// most sensitive data the app handles — this fails closed: HTTPS only,
+  /// except an http loopback for local development. This mirrors the guard in
+  /// `SpeechToTextClient` so no plaintext exfiltration path can be configured.
   LlmIntentResolver({
     required this.endpoint,
     this.apiKey,
     http.Client? httpClient,
     this.timeout = const Duration(seconds: 6),
-  }) : _http = httpClient ?? http.Client();
+  }) : _http = httpClient ?? http.Client() {
+    if (!isSafeEndpoint(endpoint)) {
+      throw ArgumentError.value(
+        endpoint.toString(),
+        'endpoint',
+        'Intent endpoint must be https (or http loopback for local dev); '
+            'transcripts must never leave the device in plaintext.',
+      );
+    }
+  }
 
   /// HTTPS endpoint that maps transcript → intent JSON. Could be the
   /// `dd-rust-vapi-phone` service (extended with an intent route) or any
@@ -79,8 +94,26 @@ class LlmIntentResolver implements IntentResolver {
   final Duration timeout;
   final http.Client _http;
 
+  /// True when [uri] is an acceptable transcript destination: https with a
+  /// host, or http only to loopback (localhost / 127.0.0.1 / ::1).
+  static bool isSafeEndpoint(Uri uri) {
+    final host = uri.host.trim();
+    if (host.isEmpty) {
+      return false;
+    }
+    if (uri.scheme == 'https') {
+      return true;
+    }
+    if (uri.scheme == 'http') {
+      return host == 'localhost' || host == '127.0.0.1' || host == '::1';
+    }
+    return false;
+  }
+
   @override
   Future<VoiceCommand> resolve(String transcript) async {
+    // Don't ship more than one utterance's worth of text off-device.
+    final clipped = VoiceLimits.clip(transcript, VoiceLimits.maxTranscriptChars);
     final headers = <String, String>{'content-type': 'application/json'};
     if (apiKey != null && apiKey!.trim().isNotEmpty) {
       headers['authorization'] = 'Bearer ${apiKey!.trim()}';
@@ -91,7 +124,7 @@ class LlmIntentResolver implements IntentResolver {
             endpoint,
             headers: headers,
             body: jsonEncode({
-              'transcript': transcript,
+              'transcript': clipped,
               // Hand the model the catalog of callable functions so it can pick
               // one and fill its parameters.
               'tools': toolSchemas(),
@@ -99,6 +132,10 @@ class LlmIntentResolver implements IntentResolver {
           )
           .timeout(timeout);
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        return _unknown(transcript);
+      }
+      // Treat the response as untrusted: refuse to parse an oversized body.
+      if (resp.bodyBytes.length > VoiceLimits.maxResponseBytes) {
         return _unknown(transcript);
       }
       return _commandFromJson(transcript, resp.body);
@@ -117,12 +154,20 @@ class LlmIntentResolver implements IntentResolver {
       final rawSlots = decoded['slots'];
       final slots = <String, String>{};
       if (rawSlots is Map) {
-        rawSlots.forEach((k, v) => slots['$k'] = '$v');
+        for (final entry in rawSlots.entries) {
+          if (slots.length >= VoiceLimits.maxSlots) {
+            break;
+          }
+          slots['${entry.key}'] =
+              VoiceLimits.clip('${entry.value}', VoiceLimits.maxSlotValueChars);
+        }
       }
-      final confidence = (decoded['confidence'] as num?)?.toDouble() ?? 0.8;
+      final confidence = VoiceLimits.sanitizeConfidence(
+        (decoded['confidence'] as num?)?.toDouble() ?? 0.8,
+      );
       return VoiceCommand(
         intent: intent,
-        transcript: transcript,
+        transcript: VoiceLimits.clip(transcript, VoiceLimits.maxTranscriptChars),
         slots: slots,
         confidence: confidence,
       );

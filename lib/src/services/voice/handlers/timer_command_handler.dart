@@ -2,6 +2,7 @@ import 'dart:async';
 
 import '../../../models/voice_command.dart';
 import '../voice_command_handler.dart';
+import '../voice_limits.dart';
 
 /// A timer started by voice. Exposed so the UI can render a countdown and so
 /// callers can cancel.
@@ -54,10 +55,23 @@ class TimerCommandHandler implements VoiceCommandHandler {
   Future<VoiceCommandResult> handle(VoiceCommand command) async {
     final raw = command.slot('durationSeconds');
     final seconds = int.tryParse(raw ?? '');
+    // Reject non-positive (incl. values that overflowed to negative upstream).
     if (seconds == null || seconds <= 0) {
       return VoiceCommandResult.failure(
         command,
         'I need a duration, like "set a timer for 10 minutes".',
+      );
+    }
+    if (seconds > VoiceLimits.maxTimerSeconds) {
+      return VoiceCommandResult.failure(
+        command,
+        "That's longer than I can set a timer for.",
+      );
+    }
+    if (_active.length >= VoiceLimits.maxActiveTimers) {
+      return VoiceCommandResult.failure(
+        command,
+        'You already have too many timers running.',
       );
     }
 

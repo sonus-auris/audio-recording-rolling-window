@@ -164,6 +164,35 @@ Being on the same Wi-Fi is not enough by itself; Android requires ADB authorizat
 
 Android SDK/JDK are configured on this machine. iOS still needs full Xcode plus CocoaPods before local iOS builds can be verified.
 
+## Desktop builds (macOS / Windows / Linux)
+
+This same codebase is also a **Flutter desktop app** — Flutter compiles to native
+machine code (macOS ARM64/x86-64, Windows EXE, Linux ELF). Desktop targets are
+enabled and the `macos/`, `windows/`, and `linux/` runners are scaffolded.
+
+The desktop build has its **own entrypoint** — `lib/main_desktop.dart` — separate
+from the phone's `lib/main.dart`. Both share the entire core (`AppController`,
+services, crypto, models) but present independent UIs and can diverge in logic:
+the phone records this device with a touch UI; the desktop uses a windowed
+nav-rail layout and is the home of the future **"All devices" master viewer**.
+Form factor / role helpers live in `lib/src/platform/form_factor.dart`.
+
+```sh
+flutter config --enable-macos-desktop --enable-windows-desktop --enable-linux-desktop
+flutter run   -d macos   -t lib/main_desktop.dart      # or: -d windows / -d linux
+flutter build macos      -t lib/main_desktop.dart      # needs full Xcode; Windows → Visual Studio; Linux → GTK/clang/ninja
+```
+
+Plugin notes on desktop: mobile-only plugins (e.g. `flutter_foreground_task`,
+foreground capture) are simply not registered on desktop and the code already
+guards them with `Platform.isAndroid`, so they no-op. `flutter_web_auth_2`
+(OAuth) pulls `desktop_webview_window` on desktop. `flutter analyze` is clean and
+`flutter test` (147 tests, incl. the multi-device crypto) passes on this machine;
+the native desktop **binary** link step needs the platform toolchain above.
+
+> This is the **Flutter** desktop app. There is also a separate, lean **pure-Rust**
+> desktop recorder in the `desktop.app.rs` repo — two desktop apps by design.
+
 ## Emulator Validation
 
 An Android API 36 ARM64 emulator named `audio_dashcam_api36` was created with microphone input enabled.
